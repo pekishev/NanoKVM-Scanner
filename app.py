@@ -43,6 +43,8 @@ LISTEN_PORT = 8765
 
 # Доля кадра: вкладки+адресная строка сверху, панель задач снизу (замер 1920x1080).
 DEFAULT_CROP = {"top": 0.10, "right": 0.0, "bottom": 0.05, "left": 0.32}
+MAX_SIDE_CROP = 0.95
+MIN_KEEP = 0.04
 
 SSL_CTX = ssl._create_unverified_context()
 
@@ -122,13 +124,37 @@ def similarity(a: bytes | None, b: bytes | None) -> float:
     return 1.0 - diff / (len(a) * 255.0)
 
 
+def _fit_crop_axis(lo: float, hi: float) -> tuple[float, float]:
+    lo = max(0.0, min(MAX_SIDE_CROP, lo))
+    hi = max(0.0, min(MAX_SIDE_CROP, hi))
+    keep = 1.0 - lo - hi
+    if keep >= MIN_KEEP:
+        return lo, hi
+    extra = MIN_KEEP - keep
+    span = lo + hi
+    if span <= 0:
+        return 0.0, 0.0
+    lo = max(0.0, lo - extra * (lo / span))
+    hi = max(0.0, hi - extra * (hi / span))
+    return lo, hi
+
+
+def parse_crop(crop: dict[str, Any] | None) -> dict[str, float]:
+    src = crop or {}
+    out = dict(DEFAULT_CROP)
+    for key in out:
+        if key in src and src[key] is not None and src[key] != "":
+            out[key] = float(src[key])
+    out["left"], out["right"] = _fit_crop_axis(out["left"], out["right"])
+    out["top"], out["bottom"] = _fit_crop_axis(out["top"], out["bottom"])
+    return out
+
+
 def crop_jpeg(jpeg: bytes, crop: dict[str, float]) -> bytes:
     if Image is None:
         return jpeg
-    top, right, bottom, left = (
-        max(0.0, min(0.45, float(crop.get(k, 0) or 0)))
-        for k in ("top", "right", "bottom", "left")
-    )
+    crop = parse_crop(crop)
+    top, right, bottom, left = (crop[k] for k in ("top", "right", "bottom", "left"))
     if top == right == bottom == left == 0:
         return jpeg
     img = Image.open(io.BytesIO(jpeg))
@@ -147,15 +173,6 @@ def crop_jpeg(jpeg: bytes, crop: dict[str, float]) -> bytes:
     return out.getvalue()
 
 
-def parse_crop(crop: dict[str, Any] | None) -> dict[str, float]:
-    src = crop or {}
-    out = dict(DEFAULT_CROP)
-    for key in out:
-        if key in src and src[key] is not None and src[key] != "":
-            out[key] = max(0.0, min(0.45, float(src[key])))
-    return out
-
-
 def hid_key_report(keycode: int, down: bool) -> bytes:
     report = bytearray(8)
     if down:
@@ -163,12 +180,19 @@ def hid_key_report(keycode: int, down: bool) -> bytes:
     return bytes(report)
 
 
-def hid_click_at(nx: float, ny: float) -> list[bytes]:
+def hid_abs_xy(nx: float, ny: float) -> tuple[int, int]:
     x = int(round(max(0.0, min(1.0, nx)) * 32767))
     y = int(round(max(0.0, min(1.0, ny)) * 32767))
-    down = bytes([1, x & 0xFF, (x >> 8) & 0xFF, y & 0xFF, (y >> 8) & 0xFF, 0])
-    up = bytes([0, x & 0xFF, (x >> 8) & 0xFF, y & 0xFF, (y >> 8) & 0xFF, 0])
-    return [down, up]
+    return x, y
+
+
+def hid_mouse_abs(nx: float, ny: float, buttons: int = 0) -> bytes:
+    x, y = hid_abs_xy(nx, ny)
+    return bytes([buttons & 0xFF, x & 0xFF, (x >> 8) & 0xFF, y & 0xFF, (y >> 8) & 0xFF, 0])
+
+
+def hid_click_at(nx: float, ny: float) -> list[bytes]:
+    return [hid_mouse_abs(nx, ny, 1), hid_mouse_abs(nx, ny, 0)]
 
 
 def hid_wheel(ticks: int) -> bytes:
@@ -297,14 +321,17 @@ class KvmClient:
             raise RuntimeError("HID WebSocket не подключён")
         ws.send_binary(payload)
 
+    def wheel(self, ticks: int) -> None:
+        self._send_ws(bytes([WS_MOUSE]) + hid_wheel(ticks))
+
     def tap_key(self, name: str, hold_ms: int = 40) -> None:
         if name == "WheelDown":
-            self._send_ws(bytes([WS_MOUSE]) + hid_wheel(-4))
+            self.wheel(-4)
             time.sleep(0.05)
-            self._send_ws(bytes([WS_MOUSE]) + hid_wheel(-4))
+            self.wheel(-4)
             return
         if name == "WheelUp":
-            self._send_ws(bytes([WS_MOUSE]) + hid_wheel(4))
+            self.wheel(4)
             return
         code = HID_KEYS.get(name)
         if code is None:
@@ -318,8 +345,17 @@ class KvmClient:
             self._send_ws(bytes([WS_MOUSE]) + report)
             time.sleep(0.04)
 
+    def move_norm(self, nx: float, ny: float) -> None:
+        payload = bytes([WS_MOUSE]) + hid_mouse_abs(nx, ny, 0)
+        self._send_ws(payload)
+        time.sleep(0.03)
+        self._send_ws(payload)
+
     def focus_center(self) -> None:
-        self.click_norm(0.62, 0.48)
+        nx, ny = content_click_point()
+        self.click_norm(nx, ny)
+        time.sleep(0.08)
+        park_mouse()
 
     def _mjpeg_loop(self) -> None:
         while not self._stop.is_set():
@@ -534,6 +570,7 @@ def ensure_session(body: dict[str, Any] | None = None) -> None:
 
 def capture_current() -> dict[str, Any]:
     ensure_session()
+    park_mouse()
     jpeg, _ = kvm.snapshot()
     page = session.save_frame(jpeg)
     if page is None:
@@ -541,17 +578,57 @@ def capture_current() -> dict[str, Any]:
     return {"duplicate": False, "page": page}
 
 
-def content_click_point() -> tuple[float, float]:
+def _clamp01(n: float, lo: float = 0.01, hi: float = 0.99) -> float:
+    return max(lo, min(hi, n))
+
+
+def point_in_crop(fx: float, fy: float) -> tuple[float, float]:
     crop = session.crop
-    nx = crop["left"] + (1.0 - crop["left"] - crop["right"]) * 0.5
-    ny = crop["top"] + (1.0 - crop["top"] - crop["bottom"]) * 0.42
-    return max(0.55, min(0.9, nx)), max(0.28, min(0.7, ny))
+    width = max(MIN_KEEP, 1.0 - crop["left"] - crop["right"])
+    height = max(MIN_KEEP, 1.0 - crop["top"] - crop["bottom"])
+    nx = crop["left"] + width * fx
+    ny = crop["top"] + height * fy
+    return _clamp01(nx), _clamp01(ny)
+
+
+def content_click_point() -> tuple[float, float]:
+    # Только кнопка «Фокус»: верх-лево области, обычно заголовок.
+    return point_in_crop(0.16, 0.10)
+
+
+def mouse_park_point() -> tuple[float, float]:
+    crop = session.crop
+    candidates = [
+        (crop["left"], (crop["left"] * 0.4, 0.06)),
+        (crop["top"], (0.06, crop["top"] * 0.45)),
+        (crop["right"], (1.0 - crop["right"] * 0.4, 0.06)),
+        (crop["bottom"], (0.06, 1.0 - crop["bottom"] * 0.4)),
+    ]
+    size, pt = max(candidates, key=lambda item: item[0])
+    if size >= 0.04:
+        return _clamp01(pt[0]), _clamp01(pt[1])
+    return 0.012, 0.012
+
+
+def park_mouse() -> None:
+    nx, ny = mouse_park_point()
+    kvm.move_norm(nx, ny)
+    prev = kvm.frame_id
+    time.sleep(0.12)
+    try:
+        kvm.wait_new_frame(prev, timeout=0.7)
+    except Exception:
+        pass
 
 
 def turn_page() -> None:
-    nx, ny = content_click_point()
-    kvm.click_norm(nx, ny)
-    time.sleep(0.12)
+    if str(session.page_key).startswith("Wheel"):
+        nx, ny = content_click_point()
+        kvm.move_norm(nx, ny)
+        time.sleep(0.05)
+        kvm.tap_key(session.page_key)
+        park_mouse()
+        return
     kvm.tap_key(session.page_key)
 
 
@@ -562,7 +639,7 @@ def wait_after_page() -> None:
         kvm.wait_new_frame(prev_id, timeout=max(1.5, session.delay_ms / 500))
     except Exception:
         pass
-    time.sleep(0.2)
+    park_mouse()
 
 
 def auto_loop() -> None:
@@ -570,12 +647,19 @@ def auto_loop() -> None:
     session.auto_stop.clear()
     session.note("автоскан запущен")
     try:
+        kvm.focus_center()
+        session.note("фокус в области съёма")
+        time.sleep(0.15)
         while not session.auto_stop.is_set():
             if len(session.pages) >= session.max_pages:
                 session.note("достигнут лимит страниц")
                 break
+            park_mouse()
             jpeg, _ = kvm.snapshot()
-            session.save_frame(jpeg)
+            page = session.save_frame(jpeg)
+            if page is None:
+                session.note("повтор кадра — автоскан остановлен")
+                break
             if session.auto_stop.is_set():
                 break
             turn_page()
@@ -592,11 +676,16 @@ def auto_loop() -> None:
         session.note("автоскан остановлен")
 
 
+# Поллинг UI и MJPEG — иначе консоль run.cmd забивается каждые ~700 мс.
+_QUIET_ACCESS_LOG = ("/api/status", "/api/preview")
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        if "/api/preview" in str(args[0] if args else ""):
+        request = str(args[0] if args else "")
+        if any(path in request for path in _QUIET_ACCESS_LOG):
             return
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
@@ -701,7 +790,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "paged": True, **result})
             if path == "/api/focus":
                 kvm.focus_center()
-                session.note("клик в центр экрана")
+                session.note("клик в статью, курсор убран из области съёма")
                 return self._json({"ok": True})
             if path == "/api/auto/start":
                 ensure_session(body)

@@ -14,6 +14,9 @@ const els = {
   cropBottom: $("crop-bottom"),
   cropLeft: $("crop-left"),
   cropRight: $("crop-right"),
+  cropLayer: $("crop-layer"),
+  cropBox: $("crop-box"),
+  cropReset: $("btn-crop-reset"),
   preview: $("preview"),
   viewfinder: $("viewfinder"),
   livePill: $("live-pill"),
@@ -23,6 +26,9 @@ const els = {
   pageCount: $("page-count"),
   folderHint: $("folder-hint"),
 };
+
+const DEFAULT_CROP = { top: 0.1, right: 0, bottom: 0.05, left: 0.32 };
+const MIN_KEEP = 0.04;
 
 const stored = JSON.parse(
   localStorage.getItem("nanokvm-scanner") || localStorage.getItem("wiki-scanner") || "{}"
@@ -36,6 +42,65 @@ if (!els.sessionName.value) {
   els.sessionName.value = `scan-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;
 }
 
+const crop = { ...DEFAULT_CROP };
+let cropDrag = null;
+
+function clamp(n, lo, hi) {
+  return Math.min(hi, Math.max(lo, n));
+}
+
+function pct(v) {
+  return String(Math.round(v * 1000) / 10);
+}
+
+function fitCropAxis(lo, hi) {
+  lo = clamp(lo, 0, 0.95);
+  hi = clamp(hi, 0, 0.95);
+  const keep = 1 - lo - hi;
+  if (keep >= MIN_KEEP) return [lo, hi];
+  const extra = MIN_KEEP - keep;
+  const span = lo + hi;
+  if (span <= 0) return [0, 0];
+  return [Math.max(0, lo - extra * (lo / span)), Math.max(0, hi - extra * (hi / span))];
+}
+
+function normalizeCrop() {
+  [crop.left, crop.right] = fitCropAxis(crop.left, crop.right);
+  [crop.top, crop.bottom] = fitCropAxis(crop.top, crop.bottom);
+}
+
+function loadCrop(src) {
+  if (!src || typeof src !== "object") return;
+  for (const key of ["top", "right", "bottom", "left"]) {
+    const n = Number(src[key]);
+    if (Number.isFinite(n)) crop[key] = n > 1 ? n / 100 : n;
+  }
+  normalizeCrop();
+}
+
+function readCropInputs() {
+  const read = (el, fallback) => {
+    const n = Number(el.value);
+    return Number.isFinite(n) ? n / 100 : fallback;
+  };
+  crop.top = read(els.cropTop, crop.top);
+  crop.bottom = read(els.cropBottom, crop.bottom);
+  crop.left = read(els.cropLeft, crop.left);
+  crop.right = read(els.cropRight, crop.right);
+  normalizeCrop();
+}
+
+function syncCropInputs() {
+  els.cropTop.value = pct(crop.top);
+  els.cropBottom.value = pct(crop.bottom);
+  els.cropLeft.value = pct(crop.left);
+  els.cropRight.value = pct(crop.right);
+}
+
+loadCrop(stored.crop);
+if (!stored.crop) readCropInputs();
+syncCropInputs();
+
 function persist() {
   localStorage.setItem(
     "nanokvm-scanner",
@@ -43,8 +108,164 @@ function persist() {
       url: els.url.value,
       user: els.user.value,
       outputDir: els.outputDir.value,
+      crop: { ...crop },
     })
   );
+}
+
+function displayedImageBox() {
+  const img = els.preview;
+  const nw = img.naturalWidth;
+  const nh = img.naturalHeight;
+  const cw = img.clientWidth;
+  const ch = img.clientHeight;
+  if (!nw || !nh || !cw || !ch) return null;
+  const scale = Math.min(cw / nw, ch / nh);
+  const w = nw * scale;
+  const h = nh * scale;
+  return { left: (cw - w) / 2, top: (ch - h) / 2, w, h };
+}
+
+function paintCrop() {
+  const box = displayedImageBox();
+  if (!box) {
+    els.cropLayer.hidden = true;
+    return;
+  }
+  els.cropLayer.hidden = false;
+  els.cropLayer.style.left = `${box.left}px`;
+  els.cropLayer.style.top = `${box.top}px`;
+  els.cropLayer.style.width = `${box.w}px`;
+  els.cropLayer.style.height = `${box.h}px`;
+  els.cropBox.style.left = `${crop.left * 100}%`;
+  els.cropBox.style.top = `${crop.top * 100}%`;
+  els.cropBox.style.width = `${(1 - crop.left - crop.right) * 100}%`;
+  els.cropBox.style.height = `${(1 - crop.top - crop.bottom) * 100}%`;
+}
+
+function applyCropRect(x0, y0, x1, y1, box) {
+  const minW = box.w * MIN_KEEP;
+  const minH = box.h * MIN_KEEP;
+  let left = Math.min(x0, x1);
+  let right = Math.max(x0, x1);
+  let top = Math.min(y0, y1);
+  let bottom = Math.max(y0, y1);
+  if (right - left < minW) {
+    if (x1 >= x0) right = left + minW;
+    else left = right - minW;
+  }
+  if (bottom - top < minH) {
+    if (y1 >= y0) bottom = top + minH;
+    else top = bottom - minH;
+  }
+  left = clamp(left, 0, box.w - minW);
+  top = clamp(top, 0, box.h - minH);
+  right = clamp(right, left + minW, box.w);
+  bottom = clamp(bottom, top + minH, box.h);
+  crop.left = left / box.w;
+  crop.top = top / box.h;
+  crop.right = 1 - right / box.w;
+  crop.bottom = 1 - bottom / box.h;
+  normalizeCrop();
+  syncCropInputs();
+  paintCrop();
+}
+
+function layerPoint(ev, origin) {
+  return { x: ev.clientX - origin.left, y: ev.clientY - origin.top };
+}
+
+els.cropLayer.addEventListener("pointerdown", (ev) => {
+  if (ev.button !== 0) return;
+  const box = displayedImageBox();
+  if (!box) return;
+  ev.preventDefault();
+  const origin = els.cropLayer.getBoundingClientRect();
+  const pt = layerPoint(ev, origin);
+  const handle = ev.target.closest(".crop-handle");
+  const start = {
+    left: crop.left * box.w,
+    top: crop.top * box.h,
+    right: (1 - crop.right) * box.w,
+    bottom: (1 - crop.bottom) * box.h,
+  };
+  let mode = "draw";
+  let dir = "";
+  if (handle) {
+    mode = "resize";
+    dir = handle.dataset.dir || "";
+  } else if (!ev.shiftKey && ev.target.closest(".crop-box")) {
+    mode = "move";
+  }
+  cropDrag = { mode, dir, origin, start, x0: pt.x, y0: pt.y };
+  els.cropLayer.setPointerCapture(ev.pointerId);
+});
+
+els.cropLayer.addEventListener("pointermove", (ev) => {
+  if (!cropDrag) return;
+  const box = displayedImageBox();
+  if (!box) return;
+  const pt = layerPoint(ev, cropDrag.origin);
+  const { start, mode, dir } = cropDrag;
+  if (mode === "draw") {
+    applyCropRect(cropDrag.x0, cropDrag.y0, pt.x, pt.y, box);
+    return;
+  }
+  if (mode === "move") {
+    const w = start.right - start.left;
+    const h = start.bottom - start.top;
+    let left = start.left + (pt.x - cropDrag.x0);
+    let top = start.top + (pt.y - cropDrag.y0);
+    left = clamp(left, 0, box.w - w);
+    top = clamp(top, 0, box.h - h);
+    applyCropRect(left, top, left + w, top + h, box);
+    return;
+  }
+  let x0 = start.left;
+  let y0 = start.top;
+  let x1 = start.right;
+  let y1 = start.bottom;
+  if (dir.includes("w")) x0 = pt.x;
+  if (dir.includes("e")) x1 = pt.x;
+  if (dir.includes("n")) y0 = pt.y;
+  if (dir.includes("s")) y1 = pt.y;
+  applyCropRect(x0, y0, x1, y1, box);
+});
+
+function endCropDrag(ev) {
+  if (!cropDrag) return;
+  cropDrag = null;
+  persist();
+  if (ev && els.cropLayer.hasPointerCapture(ev.pointerId)) {
+    els.cropLayer.releasePointerCapture(ev.pointerId);
+  }
+}
+
+els.cropLayer.addEventListener("pointerup", endCropDrag);
+els.cropLayer.addEventListener("pointercancel", endCropDrag);
+
+["cropTop", "cropBottom", "cropLeft", "cropRight"].forEach((key) => {
+  els[key].addEventListener("input", () => {
+    readCropInputs();
+    paintCrop();
+  });
+  els[key].addEventListener("change", () => {
+    readCropInputs();
+    syncCropInputs();
+    persist();
+  });
+});
+
+els.cropReset.onclick = () => {
+  Object.assign(crop, DEFAULT_CROP);
+  syncCropInputs();
+  paintCrop();
+  persist();
+};
+
+els.preview.addEventListener("load", paintCrop);
+if (window.ResizeObserver) {
+  new ResizeObserver(paintCrop).observe(els.viewfinder);
 }
 
 async function api(path, body) {
@@ -78,12 +299,7 @@ function settings() {
     delay_ms: Number(els.delayMs.value),
     max_pages: Number(els.maxPages.value),
     stop_on_duplicate: els.stopDup.checked,
-    crop: {
-      top: Number(els.cropTop.value) / 100,
-      bottom: Number(els.cropBottom.value) / 100,
-      left: Number(els.cropLeft.value) / 100,
-      right: Number(els.cropRight.value) / 100,
-    },
+    crop: { ...crop },
   };
 }
 
@@ -100,6 +316,7 @@ function renderStatus(st) {
   }
   if (live) els.viewfinder.classList.add("live");
   else els.viewfinder.classList.remove("live");
+  if (!cropDrag) paintCrop();
 
   if (st.name) {
     els.sessionPill.textContent = `${st.name} · ${st.page_count} стр.`;

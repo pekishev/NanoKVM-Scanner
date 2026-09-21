@@ -129,6 +129,33 @@ h2 {
   color: var(--muted);
 }
 
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.section-head h2 {
+  margin: 0;
+}
+
+.btn-link {
+  width: auto;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.btn-link:hover {
+  color: var(--amber-2);
+}
+
 label {
   display: block;
   font-size: 11px;
@@ -227,6 +254,7 @@ button:focus {
   border: 1px solid var(--line);
   overflow: hidden;
   min-height: 240px;
+  user-select: none;
 }
 
 .viewfinder img {
@@ -235,6 +263,11 @@ button:focus {
   height: 100%;
   object-fit: contain;
   background: #07080b;
+  pointer-events: none;
+}
+
+.viewfinder.live .corners {
+  display: none;
 }
 
 .viewfinder.live img {
@@ -277,6 +310,66 @@ button:focus {
 
 .viewfinder.scanning .scanline {
   display: block;
+}
+
+.crop-layer {
+  position: absolute;
+  z-index: 4;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.crop-box {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1.5px solid var(--amber-2);
+  box-shadow: 0 0 0 9999px #07080b8c;
+  cursor: move;
+}
+
+.crop-handle {
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  background: var(--amber);
+  border: 1px solid #1a1406;
+  box-sizing: border-box;
+  z-index: 1;
+}
+
+.crop-handle::after {
+  content: "";
+  position: absolute;
+  inset: -7px;
+}
+
+.crop-handle[data-dir="nw"] { top: -5px; left: -5px; cursor: nwse-resize; }
+.crop-handle[data-dir="ne"] { top: -5px; right: -5px; cursor: nesw-resize; }
+.crop-handle[data-dir="sw"] { bottom: -5px; left: -5px; cursor: nesw-resize; }
+.crop-handle[data-dir="se"] { bottom: -5px; right: -5px; cursor: nwse-resize; }
+.crop-handle[data-dir="n"] {
+  top: -5px;
+  left: 50%;
+  transform: translateX(-50%);
+  cursor: ns-resize;
+}
+.crop-handle[data-dir="s"] {
+  bottom: -5px;
+  left: 50%;
+  transform: translateX(-50%);
+  cursor: ns-resize;
+}
+.crop-handle[data-dir="w"] {
+  left: -5px;
+  top: 50%;
+  transform: translateY(-50%);
+  cursor: ew-resize;
+}
+.crop-handle[data-dir="e"] {
+  right: -5px;
+  top: 50%;
+  transform: translateY(-50%);
+  cursor: ew-resize;
 }
 
 @keyframes sweep {
