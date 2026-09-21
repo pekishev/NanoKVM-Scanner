@@ -1,18 +1,20 @@
 # NanoKVM Scanner
 
-Сканирует страницы с удаленного компьютера через **NanoKVM Pro** (MJPEG + HID-клавиатура) и складывает JPEG в папку.
+[English](README.md) | [Русский](README.ru.md)
 
-## Что использует в API NanoKVM
+Captures pages from a remote computer through **NanoKVM Pro** (MJPEG + HID keyboard) and saves JPEGs into a folder.
 
-- `POST /api/auth/login` — JWT (`Authorization: Bearer` или cookie `nano-kvm-token`)
-- `GET /api/stream/mjpeg` — кадры рабочего стола (`multipart/x-mixed-replace`, JPEG `FF D8`…`FF D9`)
-- `GET /api/ws` — HID: тип `1` + 8 байт клавиатуры, тип `2` + 4/6 байт мыши (как веб-клиент NanoKVM)
+## NanoKVM API used
 
-На устройстве должен быть режим **MJPEG**. Документ на удаленном ПК лучше открыть на весь экран (F11) и кликнуть в статью, чтобы Page Down листал её.
+- `POST /api/auth/login` — JWT (`Authorization: Bearer` or cookie `nano-kvm-token`)
+- `GET /api/stream/mjpeg` — desktop frames (`multipart/x-mixed-replace`, JPEG `FF D8`…`FF D9`)
+- `GET /api/ws` — HID: type `1` + 8 keyboard bytes, type `2` + 4/6 mouse bytes (same as the NanoKVM web client)
 
-## Запуск
+The device must be in **MJPEG** mode. On the remote PC, open the document fullscreen (F11) and click into the article so Page Down scrolls it.
 
-Нужен Python 3.10+.
+## Run
+
+Python 3.10+ is required.
 
 ```bat
 cd NanoKVM-Scanner
@@ -20,20 +22,20 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
-или `run.cmd`. Браузер откроет `http://127.0.0.1:8765/` (только localhost).
+or `run.cmd`. The browser opens `http://127.0.0.1:8765/` (localhost only). The UI is in Russian.
 
-1. Адрес NanoKVM, логин/пароль → **Подключить**.
-2. Имя сессии → **Создать сессию** (папка `scans/<имя>/`).
-3. На удаленном ПК откройте документ. **Фокус** — клик в центр HDMI, чтобы страница получила клавиатуру.
-4. **Снять и далее** — сохранить кадр и послать Page Down. Либо **Автоскан**.
-5. Стоп, если следующий кадр почти совпадает с предыдущим (конец статьи), или **Стоп**.
+1. NanoKVM address, login/password → **Подключить**.
+2. Session name → **Создать сессию** (folder `scans/<name>/`).
+3. On the remote PC, open the document. **Фокус** — click the center of the HDMI view so the page receives the keyboard.
+4. **Снять и далее** — save a frame and send Page Down. Or **Автоскан**.
+5. Stops when the next frame nearly matches the previous one (end of the article), or click **Стоп**.
 
-Клавиша: Page Down / Пробел / ↓ / колесо. Пауза после листания — обычно 800–1200 мс.
+Key: Page Down / Space / ↓ / mouse wheel. Pause after paging is usually 800–1200 ms.
 
-Обрезка по умолчанию: **сверху 10%** (вкладки), **слева 32%**, **снизу 5%** (панель задач). Справа 0. Рамку области можно нарисовать и подвинуть прямо на превью HDMI; числа в боковой панели синхронизируются.
+Default crop: **top 10%** (tabs), **left 32%**, **bottom 5%** (taskbar). Right 0. You can draw and move the capture frame on the HDMI preview; the numbers in the side panel stay in sync.
 
-В папке сессии:
+Session folder:
 
 - `0001.jpg`, `0002.jpg`, …
-- `manifest.json` — порядок и размеры
-- `OCR_PROMPT.md` — инструкция, чтобы распознать текст по кадрам
+- `manifest.json` — order and sizes
+- `OCR_PROMPT.md` — prompt for recognizing text from the frames
