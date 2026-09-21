@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NanoKVM Scanner</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="top">
+        <div class="brand">
+          <span class="mark" aria-hidden="true"></span>
+          <div>
+            <h1>NanoKVM Scanner</h1>
+            <p>NanoKVM Pro · MJPEG → страницы → OCR-сессия</p>
+          </div>
+        </div>
+        <div class="top-meta">
+          <span id="live-pill" class="pill off">нет сигнала</span>
+          <span id="session-pill" class="pill dim">сессия не создана</span>
+        </div>
+      </header>
+
+      <aside class="rail">
+        <section>
+          <h2>Устройство</h2>
+          <label>Адрес NanoKVM</label>
+          <input id="kvm-url" type="url" placeholder="https://192.168.1.50" spellcheck="false" />
+          <div class="row2">
+            <div>
+              <label>Логин</label>
+              <input id="kvm-user" value="admin" />
+            </div>
+            <div>
+              <label>Пароль</label>
+              <input id="kvm-pass" type="password" />
+            </div>
+          </div>
+          <button id="btn-connect" class="btn primary" type="button">Подключить</button>
+          <button id="btn-disconnect" class="btn ghost" type="button">Отключить</button>
+        </section>
+
+        <section>
+          <h2>Сессия</h2>
+          <label>Имя папки</label>
+          <input id="session-name" placeholder="session-1" spellcheck="false" />
+          <label>Куда сохранять</label>
+          <input id="output-dir" spellcheck="false" />
+          <button id="btn-session" class="btn" type="button">Создать сессию</button>
+        </section>
+
+        <section>
+          <h2>Перелистывание</h2>
+          <label>Клавиша</label>
+          <select id="page-key">
+            <option value="PageDown">Page Down</option>
+            <option value="Space">Пробел</option>
+            <option value="ArrowDown">↓</option>
+            <option value="WheelDown">Колесо мыши вниз</option>
+            <option value="PageUp">Page Up</option>
+          </select>
+          <div class="row2">
+            <div>
+              <label>Пауза, мс</label>
+              <input id="delay-ms" type="number" min="200" max="8000" step="50" value="900" />
+            </div>
+            <div>
+              <label>Макс. страниц</label>
+              <input id="max-pages" type="number" min="1" max="2000" value="300" />
+            </div>
+          </div>
+          <label class="check">
+            <input id="stop-dup" type="checkbox" checked />
+            Стоп, если кадр почти как предыдущий
+          </label>
+        </section>
+
+        <section class="advanced">
+          <h2>Обрезка кадра, %</h2>
+          <p class="hint">По умолчанию: вкладки сверху (10%), дерево wiki слева (32%), панель задач снизу (5%).</p>
+          <div class="row2">
+            <div>
+              <label>Сверху</label>
+              <input id="crop-top" type="number" min="0" max="40" step="1" value="10" />
+            </div>
+            <div>
+              <label>Снизу</label>
+              <input id="crop-bottom" type="number" min="0" max="40" step="1" value="5" />
+            </div>
+          </div>
+          <div class="row2">
+            <div>
+              <label>Слева</label>
+              <input id="crop-left" type="number" min="0" max="40" step="1" value="32" />
+            </div>
+            <div>
+              <label>Справа</label>
+              <input id="crop-right" type="number" min="0" max="40" step="1" value="0" />
+            </div>
+          </div>
+        </section>
+      </aside>
+
+      <main class="stage">
+        <div class="viewfinder" id="viewfinder">
+          <img id="preview" alt="Превью HDMI" />
+          <div class="corners" aria-hidden="true"></div>
+          <div class="scanline" aria-hidden="true"></div>
+          <div id="preview-empty" class="empty">
+            Подключите NanoKVM — здесь появится MJPEG с рабочего стола.
+          </div>
+        </div>
+        <div class="actions">
+          <button id="btn-focus" class="btn" type="button" title="Клик в центр, чтобы wiki получила фокус">
+            Фокус
+          </button>
+          <button id="btn-capture" class="btn primary" type="button">Снять</button>
+          <button id="btn-next" class="btn accent" type="button">Снять и далее</button>
+          <button id="btn-auto" class="btn" type="button">Автоскан</button>
+          <button id="btn-stop" class="btn danger" type="button">Стоп</button>
+          <button id="btn-page-only" class="btn ghost" type="button">Только листануть</button>
+        </div>
+        <pre id="log" class="log"></pre>
+      </main>
+
+      <aside class="film">
+        <div class="film-head">
+          <h2>Страницы</h2>
+          <span id="page-count">0</span>
+        </div>
+        <div id="thumbs" class="thumbs"></div>
+        <p class="hint" id="folder-hint">После скана откройте папку сессии в новой сессии Cursor и приложите OCR_PROMPT.md.</p>
+      </aside>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

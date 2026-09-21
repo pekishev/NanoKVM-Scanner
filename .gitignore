@@ -1,0 +1,15 @@
+scans/*
+!scans/.gitkeep
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+.idea/
+.vscode/
+*.log
+Thumbs.db
+.DS_Store
