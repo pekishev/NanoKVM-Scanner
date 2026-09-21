@@ -73,7 +73,38 @@ h1 {
 
 .top-meta {
   display: flex;
+  align-items: center;
   gap: 8px;
+}
+
+.lang-switch {
+  display: flex;
+  margin-right: 4px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.lang-switch button {
+  width: auto;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.lang-switch button:hover {
+  color: var(--text);
+}
+
+.lang-switch button.active {
+  background: var(--amber);
+  color: #1a1406;
 }
 
 .pill {

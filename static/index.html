@@ -13,10 +13,14 @@
           <span class="mark" aria-hidden="true"></span>
           <div>
             <h1>NanoKVM Scanner</h1>
-            <p>NanoKVM Pro · MJPEG → страницы → OCR-сессия</p>
+            <p data-i18n="tagline">NanoKVM Pro · MJPEG → страницы → OCR-сессия</p>
           </div>
         </div>
         <div class="top-meta">
+          <div class="lang-switch" role="group" data-i18n-aria="language">
+            <button type="button" data-lang="en">EN</button>
+            <button type="button" data-lang="ru">RU</button>
+          </div>
           <span id="live-pill" class="pill off">нет сигнала</span>
           <span id="session-pill" class="pill dim">сессия не создана</span>
         </div>
@@ -24,81 +28,81 @@
 
       <aside class="rail">
         <section>
-          <h2>Устройство</h2>
-          <label>Адрес NanoKVM</label>
+          <h2 data-i18n="device">Устройство</h2>
+          <label data-i18n="kvmUrl">Адрес NanoKVM</label>
           <input id="kvm-url" type="url" placeholder="https://192.168.1.50" spellcheck="false" />
           <div class="row2">
             <div>
-              <label>Логин</label>
+              <label data-i18n="login">Логин</label>
               <input id="kvm-user" value="admin" />
             </div>
             <div>
-              <label>Пароль</label>
+              <label data-i18n="password">Пароль</label>
               <input id="kvm-pass" type="password" />
             </div>
           </div>
-          <button id="btn-connect" class="btn primary" type="button">Подключить</button>
-          <button id="btn-disconnect" class="btn ghost" type="button">Отключить</button>
+          <button id="btn-connect" class="btn primary" type="button" data-i18n="connect">Подключить</button>
+          <button id="btn-disconnect" class="btn ghost" type="button" data-i18n="disconnect">Отключить</button>
         </section>
 
         <section>
-          <h2>Сессия</h2>
-          <label>Имя папки</label>
+          <h2 data-i18n="session">Сессия</h2>
+          <label data-i18n="folderName">Имя папки</label>
           <input id="session-name" placeholder="session-1" spellcheck="false" />
-          <label>Куда сохранять</label>
+          <label data-i18n="saveTo">Куда сохранять</label>
           <input id="output-dir" spellcheck="false" />
-          <button id="btn-session" class="btn" type="button">Создать сессию</button>
+          <button id="btn-session" class="btn" type="button" data-i18n="createSession">Создать сессию</button>
         </section>
 
         <section>
-          <h2>Перелистывание</h2>
-          <label>Клавиша</label>
+          <h2 data-i18n="paging">Перелистывание</h2>
+          <label data-i18n="key">Клавиша</label>
           <select id="page-key">
             <option value="PageDown">Page Down</option>
-            <option value="Space">Пробел</option>
+            <option value="Space" data-i18n="space">Пробел</option>
             <option value="ArrowDown">↓</option>
-            <option value="WheelDown">Колесо мыши вниз</option>
+            <option value="WheelDown" data-i18n="wheelDown">Колесо мыши вниз</option>
             <option value="PageUp">Page Up</option>
           </select>
           <div class="row2">
             <div>
-              <label>Пауза, мс</label>
+              <label data-i18n="pauseMs">Пауза, мс</label>
               <input id="delay-ms" type="number" min="200" max="8000" step="50" value="900" />
             </div>
             <div>
-              <label>Макс. страниц</label>
+              <label data-i18n="maxPages">Макс. страниц</label>
               <input id="max-pages" type="number" min="1" max="2000" value="300" />
             </div>
           </div>
           <label class="check">
             <input id="stop-dup" type="checkbox" checked />
-            Стоп, если кадр почти как предыдущий
+            <span data-i18n="stopDup">Стоп, если кадр почти как предыдущий</span>
           </label>
         </section>
 
         <section class="advanced">
           <div class="section-head">
-            <h2>Обрезка кадра</h2>
-            <button id="btn-crop-reset" class="btn-link" type="button">Сбросить</button>
+            <h2 data-i18n="crop">Обрезка кадра</h2>
+            <button id="btn-crop-reset" class="btn-link" type="button" data-i18n="reset">Сбросить</button>
           </div>
-          <p class="hint">Рамку на превью можно двигать и тянуть за края. Shift + протянуть — новая область.</p>
+          <p class="hint" data-i18n="cropHint">Рамку на превью можно двигать и тянуть за края. Shift + протянуть — новая область.</p>
           <div class="row2">
             <div>
-              <label>Сверху</label>
+              <label data-i18n="top">Сверху</label>
               <input id="crop-top" type="number" min="0" max="90" step="0.5" value="10" />
             </div>
             <div>
-              <label>Снизу</label>
+              <label data-i18n="bottom">Снизу</label>
               <input id="crop-bottom" type="number" min="0" max="90" step="0.5" value="5" />
             </div>
           </div>
           <div class="row2">
             <div>
-              <label>Слева</label>
+              <label data-i18n="left">Слева</label>
               <input id="crop-left" type="number" min="0" max="90" step="0.5" value="32" />
             </div>
             <div>
-              <label>Справа</label>
+              <label data-i18n="right">Справа</label>
               <input id="crop-right" type="number" min="0" max="90" step="0.5" value="0" />
             </div>
           </div>
@@ -107,7 +111,7 @@
 
       <main class="stage">
         <div class="viewfinder" id="viewfinder">
-          <img id="preview" alt="Превью HDMI" />
+          <img id="preview" alt="Превью HDMI" data-i18n-alt="previewAlt" />
           <div id="crop-layer" class="crop-layer" hidden>
             <div id="crop-box" class="crop-box">
               <span class="crop-handle" data-dir="nw"></span>
@@ -122,30 +126,30 @@
           </div>
           <div class="corners" aria-hidden="true"></div>
           <div class="scanline" aria-hidden="true"></div>
-          <div id="preview-empty" class="empty">
+          <div id="preview-empty" class="empty" data-i18n="previewEmpty">
             Подключите NanoKVM — здесь появится MJPEG с рабочего стола.
           </div>
         </div>
         <div class="actions">
-          <button id="btn-focus" class="btn" type="button" title="Один клик в статью, чтобы Page Down листал её, а не браузер">
+          <button id="btn-focus" class="btn" type="button" data-i18n="focus" data-i18n-title="focusTitle">
             Фокус
           </button>
-          <button id="btn-capture" class="btn primary" type="button">Снять</button>
-          <button id="btn-next" class="btn accent" type="button">Снять и далее</button>
-          <button id="btn-auto" class="btn" type="button">Автоскан</button>
-          <button id="btn-stop" class="btn danger" type="button">Стоп</button>
-          <button id="btn-page-only" class="btn ghost" type="button">Только листануть</button>
+          <button id="btn-capture" class="btn primary" type="button" data-i18n="capture">Снять</button>
+          <button id="btn-next" class="btn accent" type="button" data-i18n="captureNext">Снять и далее</button>
+          <button id="btn-auto" class="btn" type="button" data-i18n="autoscanBtn">Автоскан</button>
+          <button id="btn-stop" class="btn danger" type="button" data-i18n="stop">Стоп</button>
+          <button id="btn-page-only" class="btn ghost" type="button" data-i18n="pageOnly">Только листануть</button>
         </div>
         <pre id="log" class="log"></pre>
       </main>
 
       <aside class="film">
         <div class="film-head">
-          <h2>Страницы</h2>
+          <h2 data-i18n="pages">Страницы</h2>
           <span id="page-count">0</span>
         </div>
         <div id="thumbs" class="thumbs"></div>
-        <p class="hint" id="folder-hint">После скана откройте папку сессии в новой сессии Cursor и приложите OCR_PROMPT.md.</p>
+        <p class="hint" id="folder-hint" data-i18n="folderHint">После скана откройте папку сессии в новой сессии Cursor и приложите OCR_PROMPT.md.</p>
       </aside>
     </div>
     <script src="/static/app.js"></script>

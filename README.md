@@ -22,13 +22,13 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
-or `run.cmd`. The browser opens `http://127.0.0.1:8765/` (localhost only). The UI is in Russian.
+or `run.cmd`. The browser opens `http://127.0.0.1:8765/` (localhost only). Switch **EN / RU** in the header; the choice is remembered.
 
-1. NanoKVM address, login/password → **Подключить**.
-2. Session name → **Создать сессию** (folder `scans/<name>/`).
-3. On the remote PC, open the document. **Фокус** — click the center of the HDMI view so the page receives the keyboard.
-4. **Снять и далее** — save a frame and send Page Down. Or **Автоскан**.
-5. Stops when the next frame nearly matches the previous one (end of the article), or click **Стоп**.
+1. NanoKVM address, username/password → **Connect**.
+2. Session name → **Create session** (folder `scans/<name>/`).
+3. On the remote PC, open the document. **Focus** — click the center of the HDMI view so the page receives the keyboard.
+4. **Capture + next** — save a frame and send Page Down. Or **Autoscan**.
+5. Stops when the next frame nearly matches the previous one (end of the article), or click **Stop**.
 
 Key: Page Down / Space / ↓ / mouse wheel. Pause after paging is usually 800–1200 ms.
 

@@ -1,5 +1,130 @@
 const $ = (id) => document.getElementById(id);
 
+const I18N = {
+  ru: {
+    language: "Язык",
+    tagline: "NanoKVM Pro · MJPEG → страницы → OCR-сессия",
+    noSignal: "нет сигнала",
+    waitingFrame: "ждём кадр",
+    hdmiLive: "HDMI live",
+    autoscan: "автоскан",
+    noSession: "сессия не создана",
+    device: "Устройство",
+    kvmUrl: "Адрес NanoKVM",
+    login: "Логин",
+    password: "Пароль",
+    connect: "Подключить",
+    disconnect: "Отключить",
+    session: "Сессия",
+    folderName: "Имя папки",
+    saveTo: "Куда сохранять",
+    createSession: "Создать сессию",
+    paging: "Перелистывание",
+    key: "Клавиша",
+    space: "Пробел",
+    wheelDown: "Колесо мыши вниз",
+    pauseMs: "Пауза, мс",
+    maxPages: "Макс. страниц",
+    stopDup: "Стоп, если кадр почти как предыдущий",
+    crop: "Обрезка кадра",
+    reset: "Сбросить",
+    cropHint: "Рамку на превью можно двигать и тянуть за края. Shift + протянуть — новая область.",
+    top: "Сверху",
+    bottom: "Снизу",
+    left: "Слева",
+    right: "Справа",
+    previewAlt: "Превью HDMI",
+    previewEmpty: "Подключите NanoKVM — здесь появится MJPEG с рабочего стола.",
+    focus: "Фокус",
+    focusTitle: "Один клик в статью, чтобы Page Down листал её, а не браузер",
+    capture: "Снять",
+    captureNext: "Снять и далее",
+    autoscanBtn: "Автоскан",
+    stop: "Стоп",
+    pageOnly: "Только листануть",
+    pages: "Страницы",
+    folderHint: "После скана откройте папку сессии и приложите OCR_PROMPT.md.",
+    folderReady: "Папка: {dir}",
+    sessionPill: "{name} · {count} стр.",
+    log_session: "сессия {name} -> {folder}",
+    log_duplicate_frame: "этот кадр уже есть ({sim})",
+    log_captured: "снято {file} ({bytes} байт)",
+    log_auto_started: "автоскан запущен",
+    log_auto_focus: "фокус в области съёма",
+    log_page_limit: "достигнут лимит страниц",
+    log_duplicate_stop: "повтор кадра — автоскан остановлен",
+    log_end_of_document: "после листания кадр не изменился ({sim}) — конец документа",
+    log_auto_error: "автоскан ошибка: {error}",
+    log_auto_stopped: "автоскан остановлен",
+    log_connected: "подключено к {url}",
+    log_key: "клавиша {key}",
+    log_focused: "клик в статью, курсор убран из области съёма",
+    log_limit_raised: "лимит увеличен до {max_pages}, продолжаю",
+    log_error: "{error}",
+  },
+  en: {
+    language: "Language",
+    tagline: "NanoKVM Pro · MJPEG → pages → OCR session",
+    noSignal: "no signal",
+    waitingFrame: "waiting for frame",
+    hdmiLive: "HDMI live",
+    autoscan: "autoscan",
+    noSession: "no session",
+    device: "Device",
+    kvmUrl: "NanoKVM address",
+    login: "Username",
+    password: "Password",
+    connect: "Connect",
+    disconnect: "Disconnect",
+    session: "Session",
+    folderName: "Folder name",
+    saveTo: "Save to",
+    createSession: "Create session",
+    paging: "Paging",
+    key: "Key",
+    space: "Space",
+    wheelDown: "Mouse wheel down",
+    pauseMs: "Pause, ms",
+    maxPages: "Max pages",
+    stopDup: "Stop if the frame matches the previous one",
+    crop: "Crop",
+    reset: "Reset",
+    cropHint: "Drag the frame on the preview, or pull the edges. Shift+drag draws a new region.",
+    top: "Top",
+    bottom: "Bottom",
+    left: "Left",
+    right: "Right",
+    previewAlt: "HDMI preview",
+    previewEmpty: "Connect NanoKVM — the desktop MJPEG stream will appear here.",
+    focus: "Focus",
+    focusTitle: "Click into the article so Page Down scrolls it, not the browser chrome",
+    capture: "Capture",
+    captureNext: "Capture + next",
+    autoscanBtn: "Autoscan",
+    stop: "Stop",
+    pageOnly: "Page only",
+    pages: "Pages",
+    folderHint: "After the scan, open the session folder and use OCR_PROMPT.md.",
+    folderReady: "Folder: {dir}",
+    sessionPill: "{name} · {count} pages",
+    log_session: "session {name} -> {folder}",
+    log_duplicate_frame: "this frame is already saved ({sim})",
+    log_captured: "saved {file} ({bytes} bytes)",
+    log_auto_started: "autoscan started",
+    log_auto_focus: "focus in the capture area",
+    log_page_limit: "page limit reached",
+    log_duplicate_stop: "duplicate frame — autoscan stopped",
+    log_end_of_document: "frame unchanged after paging ({sim}) — end of document",
+    log_auto_error: "autoscan error: {error}",
+    log_auto_stopped: "autoscan stopped",
+    log_connected: "connected to {url}",
+    log_key: "key {key}",
+    log_focused: "clicked the article, cursor moved out of the capture area",
+    log_limit_raised: "limit raised to {max_pages}, continuing",
+    log_error: "{error}",
+  },
+};
+
 const els = {
   url: $("kvm-url"),
   user: $("kvm-user"),
@@ -29,6 +154,7 @@ const els = {
 
 const DEFAULT_CROP = { top: 0.1, right: 0, bottom: 0.05, left: 0.32 };
 const MIN_KEEP = 0.04;
+const LANGS = ["en", "ru"];
 
 const stored = JSON.parse(
   localStorage.getItem("nanokvm-scanner") || localStorage.getItem("wiki-scanner") || "{}"
@@ -40,6 +166,50 @@ if (!els.sessionName.value) {
   const d = new Date();
   const pad = (n) => String(n).padStart(2, "0");
   els.sessionName.value = `scan-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;
+}
+
+let lang = LANGS.includes(stored.lang)
+  ? stored.lang
+  : (navigator.language || "").toLowerCase().startsWith("ru")
+    ? "ru"
+    : "en";
+let lastStatus = null;
+
+function t(key, vars) {
+  const table = I18N[lang] || I18N.en;
+  let s = table[key] ?? I18N.en[key] ?? key;
+  if (vars) {
+    for (const [k, v] of Object.entries(vars)) {
+      s = s.replaceAll(`{${k}}`, String(v ?? ""));
+    }
+  }
+  return s;
+}
+
+function applyI18n() {
+  document.documentElement.lang = lang;
+  document.querySelectorAll("[data-i18n]").forEach((el) => {
+    el.textContent = t(el.dataset.i18n);
+  });
+  document.querySelectorAll("[data-i18n-title]").forEach((el) => {
+    el.title = t(el.dataset.i18nTitle);
+  });
+  document.querySelectorAll("[data-i18n-alt]").forEach((el) => {
+    el.alt = t(el.dataset.i18nAlt);
+  });
+  document.querySelectorAll("[data-i18n-aria]").forEach((el) => {
+    el.setAttribute("aria-label", t(el.dataset.i18nAria));
+  });
+  document.querySelectorAll(".lang-switch button").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.lang === lang);
+  });
+  if (!lastStatus || !lastStatus.name) {
+    els.sessionPill.textContent = t("noSession");
+  }
+  if (!lastStatus || !lastStatus.kvm?.connected) {
+    els.livePill.textContent = t("noSignal");
+  }
+  if (lastStatus) renderStatus(lastStatus);
 }
 
 const crop = { ...DEFAULT_CROP };
@@ -109,6 +279,7 @@ function persist() {
       user: els.user.value,
       outputDir: els.outputDir.value,
       crop: { ...crop },
+      lang,
     })
   );
 }
@@ -303,15 +474,24 @@ function settings() {
   };
 }
 
+function formatLogEntry(entry) {
+  if (typeof entry === "string") return entry;
+  if (!entry || typeof entry !== "object") return String(entry ?? "");
+  const time = entry.t ? `${entry.t}  ` : "";
+  if (entry.key) return time + t(`log_${entry.key}`, entry);
+  return time + (entry.error || "");
+}
+
 function renderStatus(st) {
+  lastStatus = st;
   const live = st.kvm?.connected && st.kvm?.has_frame;
-  els.livePill.textContent = st.kvm?.connected ? (live ? "HDMI live" : "ждём кадр") : "нет сигнала";
-  els.livePill.className = "pill " + (live ? "on" : "off");
   if (st.auto_running) {
-    els.livePill.textContent = "автоскан";
+    els.livePill.textContent = t("autoscan");
     els.livePill.className = "pill scan";
     els.viewfinder.classList.add("scanning");
   } else {
+    els.livePill.textContent = st.kvm?.connected ? (live ? t("hdmiLive") : t("waitingFrame")) : t("noSignal");
+    els.livePill.className = "pill " + (live ? "on" : "off");
     els.viewfinder.classList.remove("scanning");
   }
   if (live) els.viewfinder.classList.add("live");
@@ -319,13 +499,18 @@ function renderStatus(st) {
   if (!cropDrag) paintCrop();
 
   if (st.name) {
-    els.sessionPill.textContent = `${st.name} · ${st.page_count} стр.`;
+    els.sessionPill.textContent = t("sessionPill", { name: st.name, count: st.page_count || 0 });
+    els.sessionPill.className = "pill dim";
+  } else {
+    els.sessionPill.textContent = t("noSession");
     els.sessionPill.className = "pill dim";
   }
   els.pageCount.textContent = String(st.page_count || 0);
-  els.log.textContent = (st.log || []).join("\n");
+  els.log.textContent = (st.log || []).map(formatLogEntry).join("\n");
   if (st.dir) {
-    els.folderHint.textContent = `Папка: ${st.dir}. В новой сессии Cursor откройте её и приложите OCR_PROMPT.md.`;
+    els.folderHint.textContent = t("folderReady", { dir: st.dir });
+  } else {
+    els.folderHint.textContent = t("folderHint");
   }
   if (!els.outputDir.value && st.default_scans) {
     els.outputDir.value = st.default_scans;
@@ -364,6 +549,17 @@ async function poll() {
     els.log.textContent = String(err.message || err);
   }
 }
+
+function setLang(next) {
+  if (!LANGS.includes(next) || next === lang) return;
+  lang = next;
+  persist();
+  applyI18n();
+}
+
+document.querySelectorAll(".lang-switch button").forEach((btn) => {
+  btn.onclick = () => setLang(btn.dataset.lang);
+});
 
 $("btn-connect").onclick = withBusy(async () => {
   persist();
@@ -405,5 +601,7 @@ $("btn-stop").onclick = withBusy(() => api("/api/auto/stop", {}).then(poll));
   els[key].addEventListener("change", persist);
 });
 
+applyI18n();
+persist();
 poll();
 setInterval(poll, 700);

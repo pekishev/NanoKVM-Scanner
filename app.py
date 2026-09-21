@@ -410,6 +410,34 @@ class KvmClient:
         return self.snapshot()
 
 
+_LOG_RU = {
+    "session": "сессия {name} -> {folder}",
+    "duplicate_frame": "этот кадр уже есть ({sim})",
+    "captured": "снято {file} ({bytes} байт)",
+    "auto_started": "автоскан запущен",
+    "auto_focus": "фокус в области съёма",
+    "page_limit": "достигнут лимит страниц",
+    "duplicate_stop": "повтор кадра — автоскан остановлен",
+    "end_of_document": "после листания кадр не изменился ({sim}) — конец документа",
+    "auto_error": "автоскан ошибка: {error}",
+    "auto_stopped": "автоскан остановлен",
+    "connected": "подключено к {url}",
+    "key": "клавиша {key}",
+    "focused": "клик в статью, курсор убран из области съёма",
+    "limit_raised": "лимит увеличен до {max_pages}, продолжаю",
+    "error": "{error}",
+}
+
+
+def _format_log_ru(entry: dict[str, Any]) -> str:
+    tmpl = _LOG_RU.get(str(entry.get("key") or ""), "{key}")
+    try:
+        msg = tmpl.format(**{k: v for k, v in entry.items() if k not in ("t", "key")})
+    except Exception:
+        msg = str(entry.get("error") or entry.get("key") or entry)
+    return f"{entry.get('t', '')}  {msg}".strip()
+
+
 class ScanSession:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -425,13 +453,16 @@ class ScanSession:
         self.crop = dict(DEFAULT_CROP)
         self.auto_running = False
         self.auto_stop = threading.Event()
-        self.log: list[str] = []
+        self.log: list[dict[str, Any]] = []
         self.last_hash: bytes | None = None
 
-    def note(self, msg: str) -> None:
-        line = f"{datetime.now().strftime('%H:%M:%S')}  {msg}"
+    def note(self, key: str, **fields: Any) -> None:
+        entry: dict[str, Any] = {"t": datetime.now().strftime("%H:%M:%S"), "key": key}
+        for name, value in fields.items():
+            entry[name] = str(value) if isinstance(value, Path) else value
+        line = _format_log_ru(entry)
         with self.lock:
-            self.log.append(line)
+            self.log.append(entry)
             self.log = self.log[-80:]
         try:
             print(line, flush=True)
@@ -458,7 +489,7 @@ class ScanSession:
             self.crop = parse_crop(settings.get("crop"))
             self.last_hash = None
         self._write_sidecar()
-        self.note(f"сессия {name} -> {folder}")
+        self.note("session", name=name, folder=folder)
         return folder
 
     def save_frame(self, jpeg: bytes) -> dict[str, Any] | None:
@@ -469,7 +500,7 @@ class ScanSession:
         if self.last_hash is not None and bits is not None:
             sim = similarity(self.last_hash, bits)
             if self.stop_on_duplicate and sim >= self.duplicate_threshold:
-                self.note(f"этот кадр уже есть ({sim:.1%})")
+                self.note("duplicate_frame", sim=f"{sim:.1%}")
                 return None
         index = len(self.pages) + 1
         filename = f"{index:04d}.jpg"
@@ -486,7 +517,7 @@ class ScanSession:
             self.pages.append(page)
             self.last_hash = bits
         self._write_sidecar()
-        self.note(f"снято {filename} ({len(jpeg)} байт)")
+        self.note("captured", file=filename, bytes=len(jpeg))
         return page
 
     def same_as_last(self, jpeg: bytes) -> tuple[bool, float]:
@@ -645,20 +676,20 @@ def wait_after_page() -> None:
 def auto_loop() -> None:
     session.auto_running = True
     session.auto_stop.clear()
-    session.note("автоскан запущен")
+    session.note("auto_started")
     try:
         kvm.focus_center()
-        session.note("фокус в области съёма")
+        session.note("auto_focus")
         time.sleep(0.15)
         while not session.auto_stop.is_set():
             if len(session.pages) >= session.max_pages:
-                session.note("достигнут лимит страниц")
+                session.note("page_limit")
                 break
             park_mouse()
             jpeg, _ = kvm.snapshot()
             page = session.save_frame(jpeg)
             if page is None:
-                session.note("повтор кадра — автоскан остановлен")
+                session.note("duplicate_stop")
                 break
             if session.auto_stop.is_set():
                 break
@@ -667,13 +698,13 @@ def auto_loop() -> None:
             jpeg, _ = kvm.snapshot()
             same, sim = session.same_as_last(jpeg)
             if same:
-                session.note(f"после листания кадр не изменился ({sim:.1%}) — конец документа")
+                session.note("end_of_document", sim=f"{sim:.1%}")
                 break
     except Exception as exc:
-        session.note(f"автоскан ошибка: {exc}")
+        session.note("auto_error", error=str(exc))
     finally:
         session.auto_running = False
-        session.note("автоскан остановлен")
+        session.note("auto_stopped")
 
 
 # Поллинг UI и MJPEG — иначе консоль run.cmd забивается каждые ~700 мс.
@@ -763,7 +794,7 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_json()
             if path == "/api/connect":
                 kvm.connect(body.get("url") or "", body.get("username") or "admin", body.get("password") or "")
-                session.note(f"подключено к {kvm.base_url}")
+                session.note("connected", url=kvm.base_url)
                 return self._json({"ok": True, "url": kvm.base_url})
             if path == "/api/disconnect":
                 kvm.disconnect()
@@ -781,7 +812,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/page":
                 key = body.get("key") or session.page_key
                 kvm.tap_key(key)
-                session.note(f"клавиша {key}")
+                session.note("key", key=key)
                 return self._json({"ok": True})
             if path == "/api/capture-next":
                 ensure_session(body)
@@ -790,13 +821,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "paged": True, **result})
             if path == "/api/focus":
                 kvm.focus_center()
-                session.note("клик в статью, курсор убран из области съёма")
+                session.note("focused")
                 return self._json({"ok": True})
             if path == "/api/auto/start":
                 ensure_session(body)
                 if len(session.pages) >= session.max_pages:
                     session.max_pages = len(session.pages) + 100
-                    session.note(f"лимит увеличен до {session.max_pages}, продолжаю")
+                    session.note("limit_raised", max_pages=session.max_pages)
                 if session.auto_running:
                     return self._json({"ok": True, "already": True})
                 threading.Thread(target=auto_loop, daemon=True).start()
@@ -806,7 +837,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             self._json({"error": "not found"}, 404)
         except Exception as exc:
-            session.note(str(exc))
+            session.note("error", error=str(exc))
             self._json({"ok": False, "error": str(exc)}, 400)
 
     def _file(self, path: Path, content_type: str) -> None:
