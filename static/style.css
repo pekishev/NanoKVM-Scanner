@@ -346,7 +346,7 @@ button:focus {
 .crop-layer {
   position: absolute;
   z-index: 4;
-  cursor: crosshair;
+  cursor: default;
   touch-action: none;
 }
 
@@ -355,7 +355,7 @@ button:focus {
   box-sizing: border-box;
   border: 1.5px solid var(--amber-2);
   box-shadow: 0 0 0 9999px #07080b8c;
-  cursor: move;
+  cursor: default;
 }
 
 .crop-handle {

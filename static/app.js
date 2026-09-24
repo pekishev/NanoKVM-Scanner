@@ -15,6 +15,8 @@ const I18N = {
     password: "Пароль",
     connect: "Подключить",
     disconnect: "Отключить",
+    exit: "Выход",
+    exited: "приложение остановлено",
     session: "Сессия",
     folderName: "Имя папки",
     saveTo: "Куда сохранять",
@@ -28,7 +30,7 @@ const I18N = {
     stopDup: "Стоп, если кадр почти как предыдущий",
     crop: "Обрезка кадра",
     reset: "Сбросить",
-    cropHint: "Рамку на превью можно двигать и тянуть за края. Shift + протянуть — новая область.",
+    cropHint: "Клик по превью — клик на удалённом ПК, колесо — прокрутка. Рамку двигайте за края; Shift + протянуть — новая область.",
     top: "Сверху",
     bottom: "Снизу",
     left: "Слева",
@@ -59,8 +61,10 @@ const I18N = {
     log_connected: "подключено к {url}",
     log_key: "клавиша {key}",
     log_focused: "клик в статью, курсор убран из области съёма",
+    log_click: "клик {x}, {y}",
     log_limit_raised: "лимит увеличен до {max_pages}, продолжаю",
     log_error: "{error}",
+    log_shutdown: "выход",
   },
   en: {
     language: "Language",
@@ -76,6 +80,8 @@ const I18N = {
     password: "Password",
     connect: "Connect",
     disconnect: "Disconnect",
+    exit: "Exit",
+    exited: "application stopped",
     session: "Session",
     folderName: "Folder name",
     saveTo: "Save to",
@@ -89,7 +95,7 @@ const I18N = {
     stopDup: "Stop if the frame matches the previous one",
     crop: "Crop",
     reset: "Reset",
-    cropHint: "Drag the frame on the preview, or pull the edges. Shift+drag draws a new region.",
+    cropHint: "Click the preview to click the remote PC, wheel to scroll. Drag the frame edges to crop; Shift+drag draws a new region.",
     top: "Top",
     bottom: "Bottom",
     left: "Left",
@@ -120,8 +126,10 @@ const I18N = {
     log_connected: "connected to {url}",
     log_key: "key {key}",
     log_focused: "clicked the article, cursor moved out of the capture area",
+    log_click: "click {x}, {y}",
     log_limit_raised: "limit raised to {max_pages}, continuing",
     log_error: "{error}",
+    log_shutdown: "exit",
   },
 };
 
@@ -346,29 +354,68 @@ function layerPoint(ev, origin) {
   return { x: ev.clientX - origin.left, y: ev.clientY - origin.top };
 }
 
+const CLICK_PX = 6;
+
+function sendRemoteClick(nx, ny, button) {
+  if (!lastStatus?.kvm?.connected || lastStatus?.auto_running) return;
+  withBusy(async () => {
+    await api("/api/click", { x: nx, y: ny, button });
+    poll();
+  })();
+}
+
+function sendRemoteWheel(nx, ny, ticks) {
+  if (!lastStatus?.kvm?.connected || lastStatus?.auto_running || !ticks) return;
+  api("/api/wheel", { x: nx, y: ny, ticks }).catch(() => {});
+}
+
+els.viewfinder.addEventListener(
+  "wheel",
+  (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (cropDrag) return;
+    if (Math.floor(ev.deltaY) === 0) return;
+    const box = displayedImageBox();
+    if (!box) return;
+    const img = els.preview.getBoundingClientRect();
+    const x = ev.clientX - img.left - box.left;
+    const y = ev.clientY - img.top - box.top;
+    if (x < 0 || y < 0 || x > box.w || y > box.h) return;
+    // Как NanoKVM: scrollDirection по умолчанию -1, знак deltaY сводится к ±1.
+    const ticks = (ev.deltaY > 0 ? 1 : -1) * -1;
+    sendRemoteWheel(clamp(x / box.w, 0, 1), clamp(y / box.h, 0, 1), ticks);
+  },
+  { passive: false }
+);
+
+els.cropLayer.addEventListener("contextmenu", (ev) => ev.preventDefault());
+
 els.cropLayer.addEventListener("pointerdown", (ev) => {
-  if (ev.button !== 0) return;
+  if (ev.button !== 0 && ev.button !== 2) return;
   const box = displayedImageBox();
   if (!box) return;
   ev.preventDefault();
   const origin = els.cropLayer.getBoundingClientRect();
   const pt = layerPoint(ev, origin);
-  const handle = ev.target.closest(".crop-handle");
+  const handle = ev.button === 0 ? ev.target.closest(".crop-handle") : null;
   const start = {
     left: crop.left * box.w,
     top: crop.top * box.h,
     right: (1 - crop.right) * box.w,
     bottom: (1 - crop.bottom) * box.h,
   };
-  let mode = "draw";
+  let mode = "click";
   let dir = "";
   if (handle) {
     mode = "resize";
     dir = handle.dataset.dir || "";
-  } else if (!ev.shiftKey && ev.target.closest(".crop-box")) {
-    mode = "move";
+  } else if (ev.button === 0 && ev.shiftKey) {
+    mode = "draw";
+  } else if (ev.button === 0 && ev.target.closest(".crop-box")) {
+    mode = "click-or-move";
   }
-  cropDrag = { mode, dir, origin, start, x0: pt.x, y0: pt.y };
+  cropDrag = { mode, dir, origin, start, x0: pt.x, y0: pt.y, button: ev.button, moved: false };
   els.cropLayer.setPointerCapture(ev.pointerId);
 });
 
@@ -377,7 +424,17 @@ els.cropLayer.addEventListener("pointermove", (ev) => {
   const box = displayedImageBox();
   if (!box) return;
   const pt = layerPoint(ev, cropDrag.origin);
+  const dist = Math.hypot(pt.x - cropDrag.x0, pt.y - cropDrag.y0);
+  if (!cropDrag.moved && dist < CLICK_PX && cropDrag.mode !== "resize" && cropDrag.mode !== "draw") {
+    return;
+  }
+  if (!cropDrag.moved) {
+    cropDrag.moved = true;
+    if (cropDrag.mode === "click-or-move") cropDrag.mode = "move";
+    if (cropDrag.mode === "click") return;
+  }
   const { start, mode, dir } = cropDrag;
+  if (mode === "click") return;
   if (mode === "draw") {
     applyCropRect(cropDrag.x0, cropDrag.y0, pt.x, pt.y, box);
     return;
@@ -392,6 +449,7 @@ els.cropLayer.addEventListener("pointermove", (ev) => {
     applyCropRect(left, top, left + w, top + h, box);
     return;
   }
+  if (mode !== "resize") return;
   let x0 = start.left;
   let y0 = start.top;
   let x1 = start.right;
@@ -405,11 +463,19 @@ els.cropLayer.addEventListener("pointermove", (ev) => {
 
 function endCropDrag(ev) {
   if (!cropDrag) return;
+  const drag = cropDrag;
   cropDrag = null;
-  persist();
   if (ev && els.cropLayer.hasPointerCapture(ev.pointerId)) {
     els.cropLayer.releasePointerCapture(ev.pointerId);
   }
+  if (!drag.moved && drag.mode !== "resize") {
+    const box = displayedImageBox();
+    if (box && box.w && box.h) {
+      sendRemoteClick(clamp(drag.x0 / box.w, 0, 1), clamp(drag.y0 / box.h, 0, 1), drag.button);
+    }
+    return;
+  }
+  persist();
 }
 
 els.cropLayer.addEventListener("pointerup", endCropDrag);
@@ -580,6 +646,22 @@ $("btn-disconnect").onclick = withBusy(async () => {
   poll();
 });
 
+$("btn-exit").onclick = () => {
+  persist();
+  clearInterval(pollTimer);
+  previewArmed = false;
+  els.preview.removeAttribute("src");
+  const shutdown = api("/api/shutdown", {}).catch(() => {});
+  window.close();
+  shutdown.then(() => {
+    els.livePill.textContent = t("noSignal");
+    els.livePill.className = "pill off";
+    els.viewfinder.classList.remove("live", "scanning");
+    els.log.textContent = t("exited");
+    window.close();
+  });
+};
+
 $("btn-session").onclick = withBusy(async () => {
   persist();
   await api("/api/session/start", settings());
@@ -604,4 +686,4 @@ $("btn-stop").onclick = withBusy(() => api("/api/auto/stop", {}).then(poll));
 applyI18n();
 persist();
 poll();
-setInterval(poll, 700);
+const pollTimer = setInterval(poll, 700);

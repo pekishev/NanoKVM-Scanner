@@ -11,7 +11,10 @@ import argparse
 import hashlib
 import io
 import json
+import os
+import shutil
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -186,13 +189,14 @@ def hid_abs_xy(nx: float, ny: float) -> tuple[int, int]:
     return x, y
 
 
-def hid_mouse_abs(nx: float, ny: float, buttons: int = 0) -> bytes:
+def hid_mouse_abs(nx: float, ny: float, buttons: int = 0, wheel: int = 0) -> bytes:
     x, y = hid_abs_xy(nx, ny)
-    return bytes([buttons & 0xFF, x & 0xFF, (x >> 8) & 0xFF, y & 0xFF, (y >> 8) & 0xFF, 0])
+    w = max(-127, min(127, int(wheel))) & 0xFF
+    return bytes([buttons & 0xFF, x & 0xFF, (x >> 8) & 0xFF, y & 0xFF, (y >> 8) & 0xFF, w])
 
 
-def hid_click_at(nx: float, ny: float) -> list[bytes]:
-    return [hid_mouse_abs(nx, ny, 1), hid_mouse_abs(nx, ny, 0)]
+def hid_click_at(nx: float, ny: float, buttons: int = 1) -> list[bytes]:
+    return [hid_mouse_abs(nx, ny, buttons), hid_mouse_abs(nx, ny, 0)]
 
 
 def hid_wheel(ticks: int) -> bytes:
@@ -324,6 +328,11 @@ class KvmClient:
     def wheel(self, ticks: int) -> None:
         self._send_ws(bytes([WS_MOUSE]) + hid_wheel(ticks))
 
+    def wheel_at(self, nx: float, ny: float, ticks: int) -> None:
+        # Как веб-клиент NanoKVM в absolute mode: 6-байтный HID, колесо в последнем байте.
+        payload = bytes([WS_MOUSE]) + hid_mouse_abs(nx, ny, 0, ticks)
+        self._send_ws(payload)
+
     def tap_key(self, name: str, hold_ms: int = 40) -> None:
         if name == "WheelDown":
             self.wheel(-4)
@@ -340,8 +349,8 @@ class KvmClient:
         time.sleep(hold_ms / 1000)
         self._send_ws(bytes([WS_KEYBOARD]) + hid_key_report(code, False))
 
-    def click_norm(self, nx: float, ny: float) -> None:
-        for report in hid_click_at(nx, ny):
+    def click_norm(self, nx: float, ny: float, buttons: int = 1) -> None:
+        for report in hid_click_at(nx, ny, buttons):
             self._send_ws(bytes([WS_MOUSE]) + report)
             time.sleep(0.04)
 
@@ -424,8 +433,10 @@ _LOG_RU = {
     "connected": "подключено к {url}",
     "key": "клавиша {key}",
     "focused": "клик в статью, курсор убран из области съёма",
+    "click": "клик {x}, {y}",
     "limit_raised": "лимит увеличен до {max_pages}, продолжаю",
     "error": "{error}",
+    "shutdown": "выход",
 }
 
 
@@ -709,6 +720,15 @@ def auto_loop() -> None:
 
 # Поллинг UI и MJPEG — иначе консоль run.cmd забивается каждые ~700 мс.
 _QUIET_ACCESS_LOG = ("/api/status", "/api/preview")
+_CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
+
+def _client_gone(exc: BaseException) -> bool:
+    if isinstance(exc, _CLIENT_GONE):
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "winerror", None) in (10053, 10054):
+        return True
+    return False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -721,15 +741,20 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
     def _send(self, status: int, body: bytes, content_type: str, extra: dict[str, str] | None = None) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        if extra:
-            for k, v in extra.items():
-                self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            if extra:
+                for k, v in extra.items():
+                    self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if _client_gone(exc):
+                return
+            raise
 
     def _json(self, payload: Any, status: int = 200) -> None:
         code, body, ctype = json_bytes(payload, status)
@@ -799,6 +824,17 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/disconnect":
                 kvm.disconnect()
                 return self._json({"ok": True})
+            if path == "/api/shutdown":
+                session.auto_stop.set()
+                session.note("shutdown")
+
+                def _stop() -> None:
+                    time.sleep(0.2)
+                    print("stop", flush=True)
+                    os._exit(0)
+
+                threading.Thread(target=_stop, daemon=True).start()
+                return self._json({"ok": True})
             if path == "/api/session/start":
                 folder = session.start(
                     body.get("name") or f"scan-{session_stamp()}",
@@ -823,6 +859,21 @@ class Handler(BaseHTTPRequestHandler):
                 kvm.focus_center()
                 session.note("focused")
                 return self._json({"ok": True})
+            if path == "/api/click":
+                nx = float(body.get("x") if body.get("x") is not None else 0.5)
+                ny = float(body.get("y") if body.get("y") is not None else 0.5)
+                js_btn = int(body.get("button") or 0)
+                hid_btn = {0: 1, 1: 4, 2: 2}.get(js_btn, 1)
+                kvm.click_norm(nx, ny, hid_btn)
+                session.note("click", x=f"{nx:.3f}", y=f"{ny:.3f}")
+                return self._json({"ok": True})
+            if path == "/api/wheel":
+                nx = float(body.get("x") if body.get("x") is not None else 0.5)
+                ny = float(body.get("y") if body.get("y") is not None else 0.5)
+                ticks = int(body.get("ticks") or 0)
+                if ticks:
+                    kvm.wheel_at(nx, ny, ticks)
+                return self._json({"ok": True})
             if path == "/api/auto/start":
                 ensure_session(body)
                 if len(session.pages) >= session.max_pages:
@@ -837,8 +888,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             self._json({"error": "not found"}, 404)
         except Exception as exc:
+            if _client_gone(exc):
+                return
             session.note("error", error=str(exc))
-            self._json({"ok": False, "error": str(exc)}, 400)
+            try:
+                self._json({"ok": False, "error": str(exc)}, 400)
+            except Exception as send_exc:
+                if not _client_gone(send_exc):
+                    raise
 
     def _file(self, path: Path, content_type: str) -> None:
         if not path.is_file():
@@ -866,6 +923,51 @@ class Handler(BaseHTTPRequestHandler):
             return
 
 
+def _chromium_exes() -> list[Path]:
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
+    pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    pf86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+    names = [
+        pf / "Microsoft/Edge/Application/msedge.exe",
+        pf86 / "Microsoft/Edge/Application/msedge.exe",
+        pf / "Google/Chrome/Application/chrome.exe",
+        local / "Google/Chrome/Application/chrome.exe",
+        pf / "BraveSoftware/Brave-Browser/Application/brave.exe",
+        local / "BraveSoftware/Brave-Browser/Application/brave.exe",
+    ]
+    found: list[Path] = []
+    seen: set[str] = set()
+    for path in names:
+        key = str(path).lower()
+        if path.is_file() and key not in seen:
+            seen.add(key)
+            found.append(path)
+    for cmd in ("msedge", "chrome", "brave"):
+        resolved = shutil.which(cmd)
+        if resolved:
+            path = Path(resolved)
+            key = str(path).lower()
+            if key not in seen:
+                seen.add(key)
+                found.append(path)
+    return found
+
+
+def open_ui(url: str) -> None:
+    # --app даёт отдельное окно, которое страница может закрыть через window.close().
+    for exe in _chromium_exes():
+        try:
+            subprocess.Popen(
+                [str(exe), f"--app={url}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        except OSError:
+            continue
+    webbrowser.open(url)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="NanoKVM Scanner для NanoKVM Pro")
     parser.add_argument("--host", default=LISTEN_HOST)
@@ -878,11 +980,17 @@ def main() -> None:
         daemon_threads = True
         allow_reuse_address = True
 
+        def handle_error(self, request: Any, client_address: Any) -> None:
+            exc = sys.exc_info()[1]
+            if exc is not None and _client_gone(exc):
+                return
+            super().handle_error(request, client_address)
+
     httpd = Server((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}/"
     print(f"NanoKVM Scanner: {url}", flush=True)
     if not args.no_browser:
-        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+        threading.Timer(0.6, lambda: open_ui(url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
