@@ -49,6 +49,34 @@ DEFAULT_CROP = {"top": 0.10, "right": 0.0, "bottom": 0.05, "left": 0.32}
 MAX_SIDE_CROP = 0.95
 MIN_KEEP = 0.04
 
+# NanoKVM Pro: POST /api/stream/quality, 100 = пункт «Без потерь» для MJPEG.
+# Текущий видеорежим API не отдаёт. После загрузки сервер и веб-клиент ставят h264-webrtc.
+LOSSLESS_QUALITY = 100
+DEFAULT_VIDEO_MODE = "h264-webrtc"
+DEFAULT_VIDEO_QUALITY = 80
+
+# Таблица яркости IJG для quality=50, построчный порядок. В файле она лежит zigzag.
+_LUMA_Q50 = (
+    16, 11, 10, 16, 24, 40, 51, 61,
+    12, 12, 14, 19, 26, 58, 60, 55,
+    14, 13, 16, 24, 40, 57, 69, 56,
+    14, 17, 22, 29, 51, 87, 80, 62,
+    18, 22, 37, 56, 68, 109, 103, 77,
+    24, 35, 55, 64, 81, 104, 113, 92,
+    49, 64, 78, 87, 103, 121, 120, 101,
+    72, 92, 95, 98, 112, 100, 103, 99,
+)
+_ZIGZAG = (
+    0, 1, 8, 16, 9, 2, 3, 10,
+    17, 24, 32, 25, 18, 11, 4, 5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13, 6, 7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63,
+)
+
 SSL_CTX = ssl._create_unverified_context()
 
 WS_HEARTBEAT = 0
@@ -172,8 +200,84 @@ def crop_jpeg(jpeg: bytes, crop: dict[str, float]) -> bytes:
         return jpeg
     cropped = img.crop(box)
     out = io.BytesIO()
-    cropped.convert("RGB").save(out, format="JPEG", quality=92, optimize=True)
+    cropped.convert("RGB").save(
+        out, format="JPEG", quality=LOSSLESS_QUALITY, subsampling=0, optimize=True
+    )
     return out.getvalue()
+
+
+def _ijg_table(quality: int) -> tuple[int, ...]:
+    scale = 5000 // quality if quality < 50 else 200 - quality * 2
+    out: list[int] = []
+    for base in _LUMA_Q50:
+        value = (base * scale + 50) // 100
+        if value < 1:
+            value = 1
+        elif value > 255:
+            value = 255
+        out.append(value)
+    return tuple(out[i] for i in _ZIGZAG)
+
+
+def _jpeg_luma_dqt(jpeg: bytes) -> tuple[int, ...] | None:
+    i = 0
+    size = len(jpeg)
+    fallback: tuple[int, ...] | None = None
+    while i + 1 < size:
+        if jpeg[i] != 0xFF:
+            i += 1
+            continue
+        while i < size and jpeg[i] == 0xFF:
+            i += 1
+        if i >= size:
+            break
+        marker = jpeg[i]
+        i += 1
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+            continue
+        if i + 2 > size:
+            break
+        length = int.from_bytes(jpeg[i : i + 2], "big")
+        if length < 2 or i + length > size:
+            break
+        if marker == 0xDB:
+            payload = jpeg[i + 2 : i + length]
+            pos = 0
+            while pos < len(payload):
+                info = payload[pos]
+                pos += 1
+                bits16 = info >> 4
+                table_id = info & 0x0F
+                count = 128 if bits16 else 64
+                if pos + count > len(payload):
+                    break
+                if not bits16:
+                    table = tuple(payload[pos : pos + 64])
+                    if table_id == 0:
+                        return table
+                    if fallback is None:
+                        fallback = table
+                pos += count
+        if marker == 0xDA:
+            break
+        i += length
+    return fallback
+
+
+def estimate_jpeg_quality(jpeg: bytes) -> int | None:
+    table = _jpeg_luma_dqt(jpeg)
+    if table is None:
+        return None
+    best_q = 0
+    best_err = 10**9
+    for quality in range(1, 101):
+        err = sum(abs(a - b) for a, b in zip(table, _ijg_table(quality)))
+        if err < best_err:
+            best_err = err
+            best_q = quality
+    if best_err > 64:
+        return None
+    return best_q
 
 
 def hid_key_report(keycode: int, down: bool) -> bytes:
@@ -216,8 +320,11 @@ class KvmClient:
         self._stop = threading.Event()
         self._ws: websocket.WebSocket | None = None
         self._mjpeg_thread: threading.Thread | None = None
+        self._mjpeg_resp: Any = None
         self._hb_thread: threading.Thread | None = None
         self._ws_thread: threading.Thread | None = None
+        self._video_lock = threading.Lock()
+        self._saved_video: dict[str, Any] | None = None
 
     def headers(self) -> dict[str, str]:
         h = {"Accept": "*/*"}
@@ -243,9 +350,15 @@ class KvmClient:
         self._mjpeg_thread.start()
         self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._hb_thread.start()
+        self._enable_lossless()
 
     def disconnect(self) -> None:
         self._stop.set()
+        self._close_mjpeg()
+        thread = self._mjpeg_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        self._restore_video()
         with self.lock:
             self.connected = False
             ws = self._ws
@@ -256,6 +369,121 @@ class KvmClient:
             except Exception:
                 pass
         self.latest_jpeg = None
+
+    def video_override(self) -> dict[str, Any] | None:
+        with self._video_lock:
+            saved = self._saved_video
+            if not saved or not saved.get("active"):
+                return None
+            return {"mode": saved["mode"], "quality": saved["quality"]}
+
+    def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.base_url:
+            raise RuntimeError("нет адреса NanoKVM")
+        headers = self.headers()
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
+        req = urllib.request.Request(
+            self.base_url + path,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, context=SSL_CTX, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"{path} HTTP {exc.code}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"{path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"{path}: неожиданный ответ")
+        if data.get("code", 0) not in (0, None):
+            raise RuntimeError(data.get("msg") or f"{path}: ошибка")
+        return data
+
+    def _set_video(self, mode: str | None = None, quality: int | None = None) -> None:
+        if quality is not None:
+            self._post_json("/api/stream/quality", {"quality": int(quality)})
+        if mode:
+            self._post_json("/api/stream/mode", {"mode": mode})
+
+    def _wait_frame(self, prev_id: int, timeout: float) -> tuple[bytes, int] | None:
+        deadline = time.time() + timeout
+        while time.time() < deadline and not self._stop.is_set():
+            with self.lock:
+                jpeg = self.latest_jpeg
+                fid = self.frame_id
+            if jpeg and fid > prev_id:
+                return jpeg, fid
+            time.sleep(0.05)
+        return None
+
+    def _enable_lossless(self) -> None:
+        with self._video_lock:
+            if self._stop.is_set():
+                return
+            self._saved_video = {
+                "mode": DEFAULT_VIDEO_MODE,
+                "quality": DEFAULT_VIDEO_QUALITY,
+                "restore_mode": True,
+                "restore_quality": False,
+                "active": False,
+            }
+        frame = self._wait_frame(0, 8)
+        measured = estimate_jpeg_quality(frame[0]) if frame else None
+        quality = measured if measured is not None else DEFAULT_VIDEO_QUALITY
+        prev_id = frame[1] if frame else 0
+        with self._video_lock:
+            saved = self._saved_video
+            if self._stop.is_set() or saved is None:
+                return
+            saved["quality"] = quality
+            try:
+                self._set_video(quality=LOSSLESS_QUALITY)
+                saved["restore_quality"] = True
+                self._set_video(mode="mjpeg")
+                saved["active"] = True
+            except Exception as exc:
+                self.last_error = f"видео: {exc}"
+                session.note("error", error=str(exc))
+                return
+        self._wait_frame(prev_id, 3)
+
+    def _restore_video(self) -> None:
+        with self._video_lock:
+            saved = self._saved_video
+            self._saved_video = None
+        if not saved:
+            return
+        mode = str(saved["mode"]) if saved.get("restore_mode") else None
+        quality = int(saved["quality"]) if saved.get("restore_quality") else None
+        if mode is None and quality is None:
+            return
+        try:
+            self._set_video(mode=mode, quality=quality)
+        except Exception as exc:
+            with self._video_lock:
+                if self._saved_video is None:
+                    self._saved_video = saved
+            self.last_error = f"видео: {exc}"
+            session.note("error", error=str(exc))
+            return
+        session.note(
+            "video_restored",
+            mode=mode or saved["mode"],
+            quality=quality if quality is not None else "—",
+        )
+
+    def _close_mjpeg(self) -> None:
+        with self.lock:
+            resp = self._mjpeg_resp
+        if resp is None:
+            return
+        try:
+            resp.close()
+        except Exception:
+            pass
 
     def _login(self, base: str, username: str, password: str) -> str:
         payload = json.dumps({"username": username, "password": password}).encode()
@@ -371,35 +599,47 @@ class KvmClient:
             try:
                 self._read_mjpeg()
             except Exception as exc:
+                if self._stop.is_set():
+                    return
                 self.last_error = f"mjpeg: {exc}"
                 time.sleep(1)
 
     def _read_mjpeg(self) -> None:
         req = urllib.request.Request(self.base_url + "/api/stream/mjpeg", headers=self.headers())
         with urllib.request.urlopen(req, context=SSL_CTX, timeout=30) as resp:
-            buf = bytearray()
-            while not self._stop.is_set():
-                chunk = resp.read(16384)
-                if not chunk:
+            with self.lock:
+                self._mjpeg_resp = resp
+            try:
+                self._consume_mjpeg(resp)
+            finally:
+                with self.lock:
+                    if self._mjpeg_resp is resp:
+                        self._mjpeg_resp = None
+
+    def _consume_mjpeg(self, resp: Any) -> None:
+        buf = bytearray()
+        while not self._stop.is_set():
+            chunk = resp.read(16384)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if len(buf) > 8_000_000:
+                buf.clear()
+                continue
+            while True:
+                start = buf.find(b"\xff\xd8")
+                if start < 0:
                     break
-                buf.extend(chunk)
-                if len(buf) > 8_000_000:
-                    buf.clear()
-                    continue
-                while True:
-                    start = buf.find(b"\xff\xd8")
-                    if start < 0:
-                        break
-                    end = buf.find(b"\xff\xd9", start + 2)
-                    if end < 0:
-                        if start > 0:
-                            del buf[:start]
-                        break
-                    jpeg = bytes(buf[start : end + 2])
-                    del buf[: end + 2]
-                    with self.lock:
-                        self.latest_jpeg = jpeg
-                        self.frame_id += 1
+                end = buf.find(b"\xff\xd9", start + 2)
+                if end < 0:
+                    if start > 0:
+                        del buf[:start]
+                    break
+                jpeg = bytes(buf[start : end + 2])
+                del buf[: end + 2]
+                with self.lock:
+                    self.latest_jpeg = jpeg
+                    self.frame_id += 1
 
     def snapshot(self) -> tuple[bytes, int]:
         with self.lock:
@@ -431,6 +671,8 @@ _LOG_RU = {
     "auto_error": "автоскан ошибка: {error}",
     "auto_stopped": "автоскан остановлен",
     "connected": "подключено к {url}",
+    "video_lossless": "MJPEG без потерь (вернуться к {mode}, качество {quality})",
+    "video_restored": "видео восстановлено: {mode}, качество {quality}",
     "key": "клавиша {key}",
     "focused": "клик в статью, курсор убран из области съёма",
     "click": "клик {x}, {y}",
@@ -793,6 +1035,7 @@ class Handler(BaseHTTPRequestHandler):
                 "has_frame": kvm.latest_jpeg is not None,
                 "error": kvm.last_error,
                 "pillow": Image is not None,
+                "video": kvm.video_override(),
             }
             st["default_scans"] = str(DEFAULT_SCANS)
             return self._json(st)
@@ -820,6 +1063,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/connect":
                 kvm.connect(body.get("url") or "", body.get("username") or "admin", body.get("password") or "")
                 session.note("connected", url=kvm.base_url)
+                video = kvm.video_override()
+                if video:
+                    session.note("video_lossless", mode=video["mode"], quality=video["quality"])
                 return self._json({"ok": True, "url": kvm.base_url})
             if path == "/api/disconnect":
                 kvm.disconnect()
@@ -829,6 +1075,7 @@ class Handler(BaseHTTPRequestHandler):
                 session.note("shutdown")
 
                 def _stop() -> None:
+                    kvm.disconnect()
                     time.sleep(0.2)
                     print("stop", flush=True)
                     os._exit(0)
