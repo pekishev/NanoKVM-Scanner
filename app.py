@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import layout_type
 import ocr
 
 try:
@@ -399,6 +400,43 @@ class KvmClient:
             raise RuntimeError(data.get("msg") or f"{path}: ошибка")
         return data
 
+    def keyboard_report(self, modifier: int = 0, keycode: int = 0) -> None:
+        report = bytes([modifier & 0xFF, 0, keycode & 0xFF, 0, 0, 0, 0, 0])
+        self._send_ws(bytes([WS_KEYBOARD]) + report)
+
+    def alt_shift(self) -> None:
+        # Как веб-клиент: сначала Alt, затем Shift, потом отпустить оба.
+        self.keyboard_report(0x04)
+        time.sleep(0.03)
+        self.keyboard_report(0x04 | 0x02)
+        time.sleep(0.05)
+        self.keyboard_report(0)
+
+    def paste_text(self, content: str) -> None:
+        if not content:
+            return
+        headers = self.headers()
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
+        req = urllib.request.Request(
+            self.base_url + "/api/hid/paste",
+            data=json.dumps({"content": content}).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, context=SSL_CTX, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            raise RuntimeError(f"/api/hid/paste HTTP {exc.code}: {detail}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"/api/hid/paste: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("/api/hid/paste: неожиданный ответ")
+        if data.get("code", 0) not in (0, None):
+            raise RuntimeError(data.get("msg") or "/api/hid/paste: ошибка")
+
     def _set_video(self, mode: str | None = None, quality: int | None = None) -> None:
         if quality is not None:
             self._post_json("/api/stream/quality", {"quality": int(quality)})
@@ -685,6 +723,14 @@ _LOG_RU = {
     "ocr_done": "индекс готов: {file} ({pages} стр.)",
     "ocr_error": "индекс ошибка: {error}",
     "ocr_stopped": "индекс остановлен",
+    "type_started": "набор {chars} симв., раскладка {layout}",
+    "type_switch": "Alt+Shift → {layout}",
+    "type_done": "напечатано {sent} симв.",
+    "type_stopped": "набор остановлен ({sent}/{total})",
+    "type_error": "набор ошибка: {error}",
+    "type_bad_char": "нельзя напечатать «{char}»",
+    "type_altshift": "Alt+Shift → {layout}",
+    "type_enter": "Enter",
 }
 
 
@@ -946,6 +992,103 @@ class OcrJob:
 ocr_job = OcrJob()
 
 
+class TypeJob:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.running = False
+        self.stop = threading.Event()
+        self.layout = "en"
+        self.sent = 0
+        self.total = 0
+        self.error = ""
+        self.seq = 0
+        self._segments: list[layout_type.Segment] = []
+        self._text = ""
+
+    def begin(self, text: str, layout: str, segments: list[layout_type.Segment]) -> None:
+        with self.lock:
+            self.running = True
+            self.stop.clear()
+            self.layout = layout
+            self.sent = 0
+            self.total = len(text)
+            self.seq += 1
+            self.error = ""
+            self._segments = segments
+            self._text = text
+
+    def status(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "running": self.running,
+                "layout": self.layout,
+                "sent": self.sent,
+                "total": self.total,
+                "error": self.error,
+                "seq": self.seq,
+            }
+
+
+type_job = TypeJob()
+
+
+def _layout_name(value: Any) -> str:
+    layout = str(value or "en")
+    if layout not in ("en", "ru"):
+        raise RuntimeError("неизвестная раскладка")
+    return layout
+
+
+def type_loop() -> None:
+    sent = 0
+    stopped = False
+    try:
+        with type_job.lock:
+            segments = list(type_job._segments)
+            layout = type_job.layout
+            text = type_job._text
+        session.note("type_started", chars=len(text), layout=layout)
+        current = layout
+        for segment in segments:
+            if type_job.stop.is_set() or not kvm.connected:
+                stopped = True
+                break
+            if segment.layout != current:
+                kvm.alt_shift()
+                time.sleep(0.1)
+                current = segment.layout
+                with type_job.lock:
+                    type_job.layout = current
+                session.note("type_switch", layout=current)
+            for piece in layout_type.chunk_segment(segment):
+                if type_job.stop.is_set() or not kvm.connected:
+                    stopped = True
+                    break
+                kvm.paste_text(piece.keys)
+                sent = piece.src[-1] + 1
+                with type_job.lock:
+                    type_job.sent = sent
+                    type_job.layout = current
+            if stopped:
+                break
+        if not stopped:
+            sent = len(text)
+            with type_job.lock:
+                type_job.sent = sent
+        if stopped:
+            session.note("type_stopped", sent=sent, total=len(text))
+        else:
+            session.note("type_done", sent=sent)
+    except Exception as exc:
+        with type_job.lock:
+            type_job.error = str(exc)
+            type_job.sent = sent
+        session.note("type_error", error=str(exc))
+    finally:
+        with type_job.lock:
+            type_job.running = False
+
+
 def apply_scan_settings(body: dict[str, Any]) -> None:
     if body.get("page_key"):
         session.page_key = str(body["page_key"])
@@ -1191,6 +1334,7 @@ class Handler(BaseHTTPRequestHandler):
             }
             st["default_scans"] = str(DEFAULT_SCANS)
             st["ocr"] = ocr_job.status()
+            st["type"] = type_job.status()
             if session.dir is not None and not st["ocr"]["output"]:
                 if (session.dir / ocr.INDEX_NAME).is_file():
                     st["ocr"]["output"] = ocr.INDEX_NAME
@@ -1238,11 +1382,13 @@ class Handler(BaseHTTPRequestHandler):
                     session.note("video_lossless", mode=video["mode"], quality=video["quality"])
                 return self._json({"ok": True, "url": kvm.base_url})
             if path == "/api/disconnect":
+                type_job.stop.set()
                 kvm.disconnect()
                 return self._json({"ok": True})
             if path == "/api/shutdown":
                 session.auto_stop.set()
                 ocr_job.stop.set()
+                type_job.stop.set()
                 session.note("shutdown")
 
                 def _stop() -> None:
@@ -1327,6 +1473,46 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             if path == "/api/ocr/stop":
                 ocr_job.stop.set()
+                return self._json({"ok": True})
+            if path == "/api/type/start":
+                text = str(body.get("text") or "")
+                layout = _layout_name(body.get("layout"))
+                try:
+                    segments = layout_type.plan_paste(text, layout)
+                except layout_type.BadChar as exc:
+                    session.note("type_bad_char", char=exc.char)
+                    return self._json({"ok": False, "error": "bad_char", "char": exc.char}, 400)
+                if not kvm.connected:
+                    raise RuntimeError("нет связи с NanoKVM")
+                if type_job.running:
+                    return self._json({"ok": True, "already": True})
+                if not any(segment.keys for segment in segments):
+                    return self._json({"ok": True, "empty": True, "layout": layout})
+                type_job.begin(text, layout, segments)
+                threading.Thread(target=type_loop, daemon=True).start()
+                return self._json({"ok": True, "layout": layout, "seq": type_job.status()["seq"]})
+            if path == "/api/type/stop":
+                type_job.stop.set()
+                return self._json({"ok": True})
+            if path == "/api/type/altshift":
+                if not kvm.connected:
+                    raise RuntimeError("нет связи с NanoKVM")
+                if type_job.running:
+                    return self._json({"ok": False, "error": "busy"}, 409)
+                layout = _layout_name(body.get("layout"))
+                kvm.alt_shift()
+                layout = "ru" if layout == "en" else "en"
+                with type_job.lock:
+                    type_job.layout = layout
+                session.note("type_altshift", layout=layout)
+                return self._json({"ok": True, "layout": layout})
+            if path == "/api/type/enter":
+                if not kvm.connected:
+                    raise RuntimeError("нет связи с NanoKVM")
+                if type_job.running:
+                    return self._json({"ok": False, "error": "busy"}, 409)
+                kvm.tap_key("Enter")
+                session.note("type_enter")
                 return self._json({"ok": True})
             self._json({"error": "not found"}, 404)
         except Exception as exc:

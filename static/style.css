@@ -282,7 +282,7 @@ button:focus {
 
 .stage {
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto auto;
+  grid-template-rows: minmax(0, 1fr) auto auto auto;
   min-width: 0;
   padding: 16px;
   gap: 12px;
@@ -444,6 +444,79 @@ button:focus {
 
 .actions .btn {
   margin-top: 0;
+}
+
+.typer {
+  display: grid;
+  gap: 6px;
+}
+
+.typer-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.typer-head h2,
+.typer .hint {
+  margin: 0;
+}
+
+.typer-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.typer-tools label {
+  margin: 0;
+}
+
+.typer-tools select {
+  width: auto;
+  padding: 4px 8px;
+}
+
+.typer-tools .btn,
+.typer-bar .btn {
+  width: auto;
+  margin: 0;
+  padding: 6px 10px;
+}
+
+.typer textarea {
+  width: 100%;
+  min-height: 4.5em;
+  max-height: 9em;
+  resize: vertical;
+  background: #12151c;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 8px 9px;
+  font: 13px/1.4 ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+
+.typer textarea:focus {
+  outline: 1px solid var(--amber);
+  outline-offset: 1px;
+}
+
+.typer-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+#type-stats {
+  flex: 1;
+  min-width: 12em;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .log {

@@ -148,6 +148,28 @@
           <button id="btn-stop" class="btn danger" type="button" data-i18n="stop">Стоп</button>
           <button id="btn-page-only" class="btn ghost" type="button" data-i18n="pageOnly">Только листануть</button>
         </div>
+        <section class="typer" aria-labelledby="typer-title">
+          <div class="typer-head">
+            <h2 id="typer-title" data-i18n="typeTitle">Набор</h2>
+            <div class="typer-tools">
+              <label for="type-layout" data-i18n="typeLayout">Раскладка</label>
+              <select id="type-layout">
+                <option value="en" data-i18n="typeEn">EN</option>
+                <option value="ru" data-i18n="typeRu">RU</option>
+              </select>
+              <button id="btn-altshift" class="btn ghost" type="button" data-i18n="typeAltShift" data-i18n-title="typeAltShiftTip">Alt+Shift</button>
+              <button id="btn-type-enter" class="btn ghost" type="button">Enter</button>
+            </div>
+          </div>
+          <p class="hint" data-i18n="typeHint">На удалённый ПК, как набор клавиш. Укажите текущую раскладку: смешанный текст сам шлёт Alt+Shift.</p>
+          <textarea id="type-text" rows="3" data-i18n-placeholder="typePlaceholder" placeholder="Текст для удалённого ПК…"></textarea>
+          <div class="typer-bar">
+            <span id="type-stats"></span>
+            <button id="btn-type" class="btn accent" type="button" data-i18n="typeRun">Напечатать</button>
+            <button id="btn-type-stop" class="btn danger" type="button" hidden data-i18n="typeStop">Стоп</button>
+            <button id="btn-type-clear" class="btn ghost" type="button" data-i18n="typeClear">Очистить</button>
+          </div>
+        </section>
         <pre id="log" class="log"></pre>
       </main>
 

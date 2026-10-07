@@ -84,6 +84,32 @@ const I18N = {
     log_ocr_done: "индекс готов: {file} ({pages} стр.)",
     log_ocr_error: "индекс ошибка: {error}",
     log_ocr_stopped: "индекс остановлен",
+    typeTitle: "Набор",
+    typeLayout: "Раскладка",
+    typeEn: "EN",
+    typeRu: "RU",
+    typeAltShift: "Alt+Shift",
+    typeAltShiftTip: "Переключить раскладку на удалённом ПК",
+    typeHint: "На удалённый ПК, как набор клавиш. Укажите текущую раскладку: смешанный текст сам шлёт Alt+Shift.",
+    typePlaceholder: "Текст для удалённого ПК…",
+    typeRun: "Напечатать",
+    typeStop: "Стоп",
+    typeClear: "Очистить",
+    typeSec: "~{sec} с",
+    typeMin: "~{min} мин",
+    typeMinSec: "~{min} мин {sec} с",
+    typeStats: "{lines} стр., {chars} симв., {time}",
+    typeProgress: "печатается {sent}/{total}",
+    typeBadChar: "Нельзя напечатать «{char}»",
+    typeBusy: "Сначала дождитесь конца набора",
+    log_type_started: "набор {chars} симв., раскладка {layout}",
+    log_type_switch: "Alt+Shift → {layout}",
+    log_type_done: "напечатано {sent} симв.",
+    log_type_stopped: "набор остановлен ({sent}/{total})",
+    log_type_error: "набор ошибка: {error}",
+    log_type_bad_char: "нельзя напечатать «{char}»",
+    log_type_altshift: "Alt+Shift → {layout}",
+    log_type_enter: "Enter",
   },
   en: {
     language: "Language",
@@ -168,6 +194,32 @@ const I18N = {
     log_ocr_done: "index ready: {file} ({pages} pages)",
     log_ocr_error: "index error: {error}",
     log_ocr_stopped: "index stopped",
+    typeTitle: "Type",
+    typeLayout: "Layout",
+    typeEn: "EN",
+    typeRu: "RU",
+    typeAltShift: "Alt+Shift",
+    typeAltShiftTip: "Switch the layout on the remote PC",
+    typeHint: "Types on the remote PC. Set its current layout; mixed text sends Alt+Shift on its own.",
+    typePlaceholder: "Text for the remote PC…",
+    typeRun: "Type",
+    typeStop: "Stop",
+    typeClear: "Clear",
+    typeSec: "~{sec} s",
+    typeMin: "~{min} min",
+    typeMinSec: "~{min} min {sec} s",
+    typeStats: "{lines} lines, {chars} chars, {time}",
+    typeProgress: "typing {sent}/{total}",
+    typeBadChar: "Cannot type “{char}”",
+    typeBusy: "Wait until typing finishes",
+    log_type_started: "typing {chars} chars, layout {layout}",
+    log_type_switch: "Alt+Shift → {layout}",
+    log_type_done: "typed {sent} chars",
+    log_type_stopped: "typing stopped ({sent}/{total})",
+    log_type_error: "typing error: {error}",
+    log_type_bad_char: "cannot type “{char}”",
+    log_type_altshift: "Alt+Shift → {layout}",
+    log_type_enter: "Enter",
   },
 };
 
@@ -198,6 +250,14 @@ const els = {
   thumbs: $("thumbs"),
   pageCount: $("page-count"),
   folderHint: $("folder-hint"),
+  typeText: $("type-text"),
+  typeLayout: $("type-layout"),
+  typeStats: $("type-stats"),
+  typeBtn: $("btn-type"),
+  typeStop: $("btn-type-stop"),
+  typeClear: $("btn-type-clear"),
+  typeAlt: $("btn-altshift"),
+  typeEnter: $("btn-type-enter"),
 };
 
 const DEFAULT_CROP = { top: 0.1, right: 0, bottom: 0.05, left: 0.32 };
@@ -209,6 +269,7 @@ const stored = JSON.parse(
 );
 if (stored.url) els.url.value = stored.url;
 if (stored.user) els.user.value = stored.user;
+if (stored.typeLayout === "en" || stored.typeLayout === "ru") els.typeLayout.value = stored.typeLayout;
 if (stored.outputDir) els.outputDir.value = stored.outputDir;
 if (!els.sessionName.value) {
   const d = new Date();
@@ -247,6 +308,9 @@ function applyI18n() {
   });
   document.querySelectorAll("[data-i18n-aria]").forEach((el) => {
     el.setAttribute("aria-label", t(el.dataset.i18nAria));
+  });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
+    el.placeholder = t(el.dataset.i18nPlaceholder);
   });
   document.querySelectorAll(".lang-switch button").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.lang === lang);
@@ -328,6 +392,7 @@ function persist() {
       outputDir: els.outputDir.value,
       crop: { ...crop },
       lang,
+      typeLayout: els.typeLayout.value,
     })
   );
 }
@@ -553,7 +618,9 @@ async function api(path, body) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.ok === false) {
-    throw new Error(data.error || `HTTP ${res.status}`);
+    const error = new Error(data.error || `HTTP ${res.status}`);
+    error.payload = data;
+    throw error;
   }
   return data;
 }
@@ -641,6 +708,7 @@ function renderStatus(st) {
     els.ocrBtn.classList.toggle("danger", ocring);
     els.ocrBtn.classList.toggle("accent", !ocring);
   }
+  syncType(st);
   if (!els.outputDir.value && st.default_scans) {
     els.outputDir.value = st.default_scans;
   }
@@ -741,6 +809,109 @@ $("btn-auto").onclick = withBusy(async () => {
   poll();
 });
 $("btn-stop").onclick = withBusy(() => api("/api/auto/stop", {}).then(poll));
+const TYPE_CPS = 20;
+let typeOrigin = "";
+let typeWatch = 0;
+
+function formatDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "—";
+  const sec = Math.ceil(ms / 1000);
+  if (sec < 60) return t("typeSec", { sec });
+  const min = Math.floor(sec / 60);
+  const rest = sec % 60;
+  return rest ? t("typeMinSec", { min, sec: rest }) : t("typeMin", { min });
+}
+
+function updateTypeStats() {
+  const raw = els.typeText.value || "";
+  if (!raw) {
+    els.typeStats.textContent = "";
+    return;
+  }
+  const sec = Math.ceil(raw.length / TYPE_CPS);
+  els.typeStats.textContent = t("typeStats", {
+    lines: raw.split("\n").length,
+    chars: raw.length,
+    time: formatDuration(sec * 1000),
+  });
+}
+
+function typeError(err) {
+  const code = err?.payload?.error;
+  if (code === "bad_char") return new Error(t("typeBadChar", { char: err.payload.char || "?" }));
+  if (code === "busy") return new Error(t("typeBusy"));
+  return err;
+}
+
+function syncType(st) {
+  const job = st.type || {};
+  const running = Boolean(job.running);
+  const watching = Boolean(typeWatch) && job.seq === typeWatch;
+  if ((running || watching) && (job.layout === "en" || job.layout === "ru") && els.typeLayout.value !== job.layout) {
+    els.typeLayout.value = job.layout;
+    persist();
+  }
+  if (watching && !running && els.typeText.value === typeOrigin) {
+    if (!job.error && job.total > 0 && job.sent >= job.total) {
+      els.typeText.value = "";
+    } else if (job.sent > 0 && job.sent < typeOrigin.length) {
+      els.typeText.value = typeOrigin.slice(job.sent);
+    }
+    typeOrigin = els.typeText.value;
+    typeWatch = 0;
+  }
+  els.typeBtn.hidden = running;
+  els.typeStop.hidden = !running;
+  els.typeClear.hidden = running;
+  els.typeText.readOnly = running;
+  els.typeLayout.disabled = running;
+  els.typeAlt.disabled = running;
+  els.typeEnter.disabled = running;
+  if (running) {
+    els.typeStats.textContent = t("typeProgress", { sent: job.sent || 0, total: job.total || 0 });
+  } else {
+    updateTypeStats();
+  }
+}
+
+els.typeText.addEventListener("input", updateTypeStats);
+els.typeLayout.addEventListener("change", persist);
+
+$("btn-type").onclick = withBusy(async () => {
+  const text = els.typeText.value || "";
+  if (!text) return;
+  typeOrigin = text;
+  try {
+    const data = await api("/api/type/start", { text, layout: els.typeLayout.value });
+    if (data.seq) typeWatch = data.seq;
+  } catch (err) {
+    throw typeError(err);
+  }
+  poll();
+});
+
+$("btn-type-stop").onclick = withBusy(() => api("/api/type/stop", {}).then(poll));
+
+$("btn-type-clear").onclick = () => {
+  els.typeText.value = "";
+  typeOrigin = "";
+  els.typeText.focus();
+  updateTypeStats();
+};
+
+$("btn-altshift").onclick = withBusy(async () => {
+  try {
+    const data = await api("/api/type/altshift", { layout: els.typeLayout.value });
+    if (data.layout === "en" || data.layout === "ru") els.typeLayout.value = data.layout;
+    persist();
+  } catch (err) {
+    throw typeError(err);
+  }
+  poll();
+});
+
+$("btn-type-enter").onclick = withBusy(() => api("/api/type/enter", {}).then(poll));
+
 $("btn-ocr").onclick = withBusy(async () => {
   persist();
   if (lastStatus?.ocr?.running) {
