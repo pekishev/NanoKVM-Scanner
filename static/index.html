@@ -13,7 +13,7 @@
           <span class="mark" aria-hidden="true"></span>
           <div>
             <h1>NanoKVM Scanner</h1>
-            <p data-i18n="tagline">NanoKVM Pro · MJPEG → страницы → OCR-сессия</p>
+            <p data-i18n="tagline">NanoKVM Pro · MJPEG → страницы → индекс файлов</p>
           </div>
         </div>
         <div class="top-meta">
@@ -53,6 +53,13 @@
           <label data-i18n="saveTo">Куда сохранять</label>
           <input id="output-dir" spellcheck="false" />
           <button id="btn-session" class="btn" type="button" data-i18n="createSession">Создать сессию</button>
+        </section>
+
+        <section>
+          <h2 data-i18n="ocr">Индекс</h2>
+          <p class="hint" data-i18n="ocrIntro">По кадрам собирается список «страница → файл» (diff --git). Картинки остаются источником правды; индекс только для навигации.</p>
+          <button id="btn-ocr" class="btn accent" type="button" data-i18n="ocrRun">Построить индекс</button>
+          <a id="ocr-open" class="btn-link ocr-open" hidden href="/api/ocr/result" target="_blank" rel="noopener" data-i18n="ocrOpen">Открыть индекс</a>
         </section>
 
         <section>
@@ -150,7 +157,7 @@
           <span id="page-count">0</span>
         </div>
         <div id="thumbs" class="thumbs"></div>
-        <p class="hint" id="folder-hint" data-i18n="folderHint">После скана откройте папку сессии в новой сессии Cursor и приложите OCR_PROMPT.md.</p>
+        <p class="hint" id="folder-hint" data-i18n="folderHint">После скана нажмите «Распознать» — локальная OCR-VLM сшьёт markdown.</p>
       </aside>
     </div>
     <script src="/static/app.js"></script>

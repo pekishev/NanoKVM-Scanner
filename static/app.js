@@ -3,11 +3,12 @@ const $ = (id) => document.getElementById(id);
 const I18N = {
   ru: {
     language: "Язык",
-    tagline: "NanoKVM Pro · MJPEG → страницы → OCR-сессия",
+    tagline: "NanoKVM Pro · MJPEG → страницы → индекс файлов",
     noSignal: "нет сигнала",
     waitingFrame: "ждём кадр",
     hdmiLive: "HDMI live",
     autoscan: "автоскан",
+    ocring: "индекс",
     noSession: "сессия не создана",
     device: "Устройство",
     kvmUrl: "Адрес NanoKVM",
@@ -28,6 +29,13 @@ const I18N = {
     pauseMs: "Пауза, мс",
     maxPages: "Макс. страниц",
     stopDup: "Стоп, если кадр совпадает с предыдущим",
+    ocr: "Индекс",
+    ocrIntro: "По кадрам собирается список «страница → файл» (diff --git). Картинки остаются источником правды; индекс только для навигации.",
+    ocrRun: "Построить индекс",
+    ocrStop: "Стоп",
+    ocrOpen: "Открыть индекс",
+    ocrReady: "Индекс: {file}",
+    ocrProgress: "индекс {page}/{pages}",
     crop: "Обрезка кадра",
     reset: "Сбросить",
     cropHint: "Клик по превью — клик на удалённом ПК, колесо — прокрутка. Рамку двигайте за края; Shift + протянуть — новая область.",
@@ -45,10 +53,11 @@ const I18N = {
     stop: "Стоп",
     pageOnly: "Только листануть",
     pages: "Страницы",
-    folderHint: "После скана откройте папку сессии и приложите OCR_PROMPT.md.",
+    folderHint: "После скана нажмите «Построить индекс» — получите страницу → файл. JPEG остаётся источником правды.",
     folderReady: "Папка: {dir}",
     sessionPill: "{name} · {count} стр.",
     log_session: "сессия {name} -> {folder}",
+    log_session_opened: "сессия {name} открыта ({count} стр.) -> {folder}",
     log_duplicate_frame: "этот кадр уже есть ({sim})",
     log_captured: "снято {file} ({bytes} байт)",
     log_auto_started: "автоскан запущен",
@@ -67,14 +76,23 @@ const I18N = {
     log_limit_raised: "лимит увеличен до {max_pages}, продолжаю",
     log_error: "{error}",
     log_shutdown: "выход",
+    log_ocr_started: "индекс {model}",
+    log_ocr_page: "индекс {page}/{pages} ({file})",
+    log_ocr_strip: "OCR полоса {strip}/{strips} страницы {page}",
+    log_ocr_overlap: "сшивка {a}→{b}: снято {n} строк перехлёста ({sim})",
+    log_ocr_break: "разрыв между страницами {a} и {b} — нет перехлёста",
+    log_ocr_done: "индекс готов: {file} ({pages} стр.)",
+    log_ocr_error: "индекс ошибка: {error}",
+    log_ocr_stopped: "индекс остановлен",
   },
   en: {
     language: "Language",
-    tagline: "NanoKVM Pro · MJPEG → pages → OCR session",
+    tagline: "NanoKVM Pro · MJPEG → pages → file index",
     noSignal: "no signal",
     waitingFrame: "waiting for frame",
     hdmiLive: "HDMI live",
     autoscan: "autoscan",
+    ocring: "index",
     noSession: "no session",
     device: "Device",
     kvmUrl: "NanoKVM address",
@@ -95,6 +113,13 @@ const I18N = {
     pauseMs: "Pause, ms",
     maxPages: "Max pages",
     stopDup: "Stop if the frame matches the previous one",
+    ocr: "Index",
+    ocrIntro: "Builds a page → file list from GitLab diff headers. JPEGs stay the source of truth; the index is only for navigation.",
+    ocrRun: "Build index",
+    ocrStop: "Stop",
+    ocrOpen: "Open index",
+    ocrReady: "Index: {file}",
+    ocrProgress: "index {page}/{pages}",
     crop: "Crop",
     reset: "Reset",
     cropHint: "Click the preview to click the remote PC, wheel to scroll. Drag the frame edges to crop; Shift+drag draws a new region.",
@@ -112,10 +137,11 @@ const I18N = {
     stop: "Stop",
     pageOnly: "Page only",
     pages: "Pages",
-    folderHint: "After the scan, open the session folder and use OCR_PROMPT.md.",
+    folderHint: "After the scan, click Build index — you get page → file. JPEGs stay the source of truth.",
     folderReady: "Folder: {dir}",
     sessionPill: "{name} · {count} pages",
     log_session: "session {name} -> {folder}",
+    log_session_opened: "session {name} opened ({count} pages) -> {folder}",
     log_duplicate_frame: "this frame is already saved ({sim})",
     log_captured: "saved {file} ({bytes} bytes)",
     log_auto_started: "autoscan started",
@@ -134,6 +160,14 @@ const I18N = {
     log_limit_raised: "limit raised to {max_pages}, continuing",
     log_error: "{error}",
     log_shutdown: "exit",
+    log_ocr_started: "index {model}",
+    log_ocr_page: "index {page}/{pages} ({file})",
+    log_ocr_strip: "OCR strip {strip}/{strips} of page {page}",
+    log_ocr_overlap: "stitch {a}→{b}: dropped {n} overlapping lines ({sim})",
+    log_ocr_break: "break between pages {a} and {b} — no overlap",
+    log_ocr_done: "index ready: {file} ({pages} pages)",
+    log_ocr_error: "index error: {error}",
+    log_ocr_stopped: "index stopped",
   },
 };
 
@@ -154,6 +188,8 @@ const els = {
   cropLayer: $("crop-layer"),
   cropBox: $("crop-box"),
   cropReset: $("btn-crop-reset"),
+  ocrBtn: $("btn-ocr"),
+  ocrOpen: $("ocr-open"),
   preview: $("preview"),
   viewfinder: $("viewfinder"),
   livePill: $("live-pill"),
@@ -555,8 +591,13 @@ function formatLogEntry(entry) {
 function renderStatus(st) {
   lastStatus = st;
   const live = st.kvm?.connected && st.kvm?.has_frame;
+  const ocring = Boolean(st.ocr?.running);
   if (st.auto_running) {
     els.livePill.textContent = t("autoscan");
+    els.livePill.className = "pill scan";
+    els.viewfinder.classList.add("scanning");
+  } else if (ocring) {
+    els.livePill.textContent = t("ocring");
     els.livePill.className = "pill scan";
     els.viewfinder.classList.add("scanning");
   } else {
@@ -569,7 +610,14 @@ function renderStatus(st) {
   if (!cropDrag) paintCrop();
 
   if (st.name) {
-    els.sessionPill.textContent = t("sessionPill", { name: st.name, count: st.page_count || 0 });
+    els.sessionPill.textContent = ocring
+      ? t("ocrProgress", {
+          page: st.ocr.page || 0,
+          pages: st.ocr.pages || st.page_count || 0,
+          strip: st.ocr.strip || 0,
+          strips: st.ocr.strips || 0,
+        })
+      : t("sessionPill", { name: st.name, count: st.page_count || 0 });
     els.sessionPill.className = "pill dim";
   } else {
     els.sessionPill.textContent = t("noSession");
@@ -577,10 +625,21 @@ function renderStatus(st) {
   }
   els.pageCount.textContent = String(st.page_count || 0);
   els.log.textContent = (st.log || []).map(formatLogEntry).join("\n");
-  if (st.dir) {
+  const ocrFile = st.ocr?.titled || st.ocr?.output;
+  if (ocrFile && st.dir) {
+    els.folderHint.textContent = t("ocrReady", { file: ocrFile });
+  } else if (st.dir) {
     els.folderHint.textContent = t("folderReady", { dir: st.dir });
   } else {
     els.folderHint.textContent = t("folderHint");
+  }
+  if (els.ocrOpen) {
+    els.ocrOpen.hidden = !ocrFile;
+  }
+  if (els.ocrBtn) {
+    els.ocrBtn.textContent = ocring ? t("ocrStop") : t("ocrRun");
+    els.ocrBtn.classList.toggle("danger", ocring);
+    els.ocrBtn.classList.toggle("accent", !ocring);
   }
   if (!els.outputDir.value && st.default_scans) {
     els.outputDir.value = st.default_scans;
@@ -682,6 +741,16 @@ $("btn-auto").onclick = withBusy(async () => {
   poll();
 });
 $("btn-stop").onclick = withBusy(() => api("/api/auto/stop", {}).then(poll));
+$("btn-ocr").onclick = withBusy(async () => {
+  persist();
+  if (lastStatus?.ocr?.running) {
+    await api("/api/ocr/stop", {});
+    poll();
+    return;
+  }
+  await api("/api/ocr/start", settings());
+  poll();
+});
 
 ["url", "user", "outputDir"].forEach((key) => {
   els[key].addEventListener("change", persist);

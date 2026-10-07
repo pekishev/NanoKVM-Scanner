@@ -27,6 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import ocr
+
 try:
     import websocket
 except ImportError:
@@ -103,30 +105,15 @@ HID_KEYS = {
     "Tab": 0x2B,
 }
 
-OCR_PROMPT = """# Распознавание скриншотов
-Не загружай все JPEG в контекст сразу — иначе сессия раздуется.
+OCR_PROMPT = """# Индекс скриншотов GitLab MR
 
-## Как читать кадры
+Источник правды — JPEG в этой папке. `_index.md` только навигация: страница → файл.
+Символам OCR нельзя доверять (скобки, +/-, похожие идентификаторы, склейка hunk’ов).
+Не вставляй распознанный текст как патч.
 
-Смотри картинки **сам** инструментом чтения файлов (зрение модели).
-**Не используй OCR**
-Текст, таблицы и код снимай с кадра глазами и сразу пиши markdown.
-
-## Задача
-
-1. Прочитай `manifest.json` (число страниц, порядок файлов).
-2. Открывай **по 1–3 JPEG за раз**, распознавай содержимое, дописывай в результирующий файл, затем следующие кадры.
-3. Имя файла — по заголовку документа с первой страницы, расширение `.md`.
-   Убери из имени символы, недопустимые в имени файла Windows. Пока заголовок неизвестен — пиши во `_draft.md`, затем переименуй.
-4. Сохраняй структуру оригинала: заголовки, списки, таблицы, ссылки, код.
-5. Игнорируй хром браузера, курсор, панель NanoKVM, обои, часы, обрезанные поля.
-6. Если страница дублирует предыдущую или обрезана — коротко пометь в документе.
-7. В конце добавь краткое оглавление.
-
-## После распознавания
-
-Источник истины — получившийся `.md` (не JPEG).
-В следующих сессиях **не прикладывай картинки**, достаточно markdown.
+1. Открой `_index.md`: кадр и пути файлов на нём.
+2. Правь код по соответствующему JPEG (`0001.jpg` …).
+3. Полный `_recognized.md`, если есть, — черновик, не исходник.
 
 Сессия: {session_name}
 Страниц: {page_count}
@@ -671,6 +658,7 @@ class KvmClient:
 
 _LOG_RU = {
     "session": "сессия {name} -> {folder}",
+    "session_opened": "сессия {name} открыта ({count} стр.) -> {folder}",
     "duplicate_frame": "этот кадр уже есть ({sim})",
     "captured": "снято {file} ({bytes} байт)",
     "auto_started": "автоскан запущен",
@@ -689,16 +677,65 @@ _LOG_RU = {
     "limit_raised": "лимит увеличен до {max_pages}, продолжаю",
     "error": "{error}",
     "shutdown": "выход",
+    "ocr_started": "индекс {model}",
+    "ocr_page": "индекс {page}/{pages} ({file})",
+    "ocr_strip": "OCR полоса {strip}/{strips} страницы {page}",
+    "ocr_overlap": "сшивка {a}→{b}: снято {n} строк перехлёста ({sim})",
+    "ocr_break": "разрыв между страницами {a} и {b} — нет перехлёста",
+    "ocr_done": "индекс готов: {file} ({pages} стр.)",
+    "ocr_error": "индекс ошибка: {error}",
+    "ocr_stopped": "индекс остановлен",
 }
 
 
 def _format_log_ru(entry: dict[str, Any]) -> str:
     tmpl = _LOG_RU.get(str(entry.get("key") or ""), "{key}")
     try:
-        msg = tmpl.format(**{k: v for k, v in entry.items() if k not in ("t", "key")})
+        msg = tmpl.format_map({k: v for k, v in entry.items() if k not in ("t", "key")})
     except Exception:
         msg = str(entry.get("error") or entry.get("key") or entry)
     return f"{entry.get('t', '')}  {msg}".strip()
+
+
+def pages_from_folder(folder: Path) -> tuple[list[dict[str, Any]], str]:
+    pages: list[dict[str, Any]] = []
+    created = ""
+    manifest_path = folder / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if isinstance(data, dict):
+            created = str(data.get("created") or "")
+            raw_pages = data.get("pages") or []
+            if isinstance(raw_pages, list):
+                for item in raw_pages:
+                    if not isinstance(item, dict) or not item.get("file"):
+                        continue
+                    path = folder / Path(str(item["file"])).name
+                    if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg"}:
+                        page = dict(item)
+                        page["file"] = path.name
+                        pages.append(page)
+    if pages:
+        return pages, created
+    files = sorted(
+        [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg"}],
+        key=lambda p: p.name,
+    )
+    for index, path in enumerate(files, start=1):
+        payload = path.read_bytes()
+        pages.append(
+            {
+                "index": index,
+                "file": path.name,
+                "bytes": len(payload),
+                "md5": hashlib.md5(payload).hexdigest(),
+                "saved_at": utc_now(),
+            }
+        )
+    return pages, created
 
 
 class ScanSession:
@@ -739,20 +776,31 @@ class ScanSession:
             base = ROOT / base
         folder = base / name
         folder.mkdir(parents=True, exist_ok=True)
+        existing, created = pages_from_folder(folder)
+        last_hash = None
+        if existing:
+            last_path = folder / str(existing[-1]["file"])
+            try:
+                last_hash = frame_sig(last_path.read_bytes())
+            except Exception:
+                last_hash = None
         with self.lock:
             self.name = name
             self.dir = folder
-            self.pages = []
-            self.created = utc_now()
+            self.pages = existing
+            self.created = created or utc_now()
             self.page_key = settings.get("page_key") or "PageDown"
             self.delay_ms = int(settings.get("delay_ms") or 900)
             self.max_pages = int(settings.get("max_pages") or 300)
             self.stop_on_duplicate = bool(settings.get("stop_on_duplicate", True))
             self.duplicate_threshold = float(settings.get("duplicate_threshold") or DEFAULT_DUPLICATE_THRESHOLD)
             self.crop = parse_crop(settings.get("crop"))
-            self.last_hash = None
+            self.last_hash = last_hash
         self._write_sidecar()
-        self.note("session", name=name, folder=folder)
+        if existing:
+            self.note("session_opened", name=name, folder=folder, count=len(existing))
+        else:
+            self.note("session", name=name, folder=folder)
         return folder
 
     def save_frame(self, jpeg: bytes) -> dict[str, Any] | None:
@@ -832,6 +880,70 @@ class ScanSession:
 
 kvm = KvmClient()
 session = ScanSession()
+
+
+class OcrJob:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.running = False
+        self.stop = threading.Event()
+        self.model = ocr.DEFAULT_MODEL
+        self.lines_per_strip = ocr.DEFAULT_STRIP_LINES
+        self.page = 0
+        self.pages = 0
+        self.strip = 0
+        self.strips = 0
+        self.file = ""
+        self.output = ""
+        self.titled = ""
+        self.error = ""
+
+    def reset(self) -> None:
+        with self.lock:
+            self.running = True
+            self.stop.clear()
+            self.model = ocr.DEFAULT_MODEL
+            self.lines_per_strip = ocr.DEFAULT_STRIP_LINES
+            self.page = 0
+            self.pages = 0
+            self.strip = 0
+            self.strips = 0
+            self.file = ""
+            self.output = ""
+            self.titled = ""
+            self.error = ""
+
+    def set_progress(self, fields: dict[str, Any]) -> None:
+        with self.lock:
+            if "page" in fields:
+                self.page = int(fields["page"] or 0)
+            if "pages" in fields:
+                self.pages = int(fields["pages"] or 0)
+            if "strip" in fields:
+                self.strip = int(fields["strip"] or 0)
+            if "strips" in fields:
+                self.strips = int(fields["strips"] or 0)
+            if "file" in fields:
+                self.file = str(fields["file"] or "")
+
+    def status(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "running": self.running,
+                "model": self.model,
+                "lines_per_strip": self.lines_per_strip,
+                "page": self.page,
+                "pages": self.pages,
+                "strip": self.strip,
+                "strips": self.strips,
+                "file": self.file,
+                "output": self.output,
+                "titled": self.titled,
+                "error": self.error,
+            }
+
+
+ocr_job = OcrJob()
 
 
 def apply_scan_settings(body: dict[str, Any]) -> None:
@@ -970,6 +1082,36 @@ def auto_loop() -> None:
         session.note("auto_stopped")
 
 
+def ocr_loop() -> None:
+    try:
+        if session.dir is None:
+            raise RuntimeError("сначала создайте сессию")
+        if session.auto_running:
+            raise RuntimeError("дождитесь конца автоскана")
+        pages = list(session.pages)
+        session.note("ocr_started", model=ocr.DEFAULT_MODEL)
+        report = ocr.index_session(
+            session.dir,
+            pages,
+            stop=ocr_job.stop,
+            note=session.note,
+            on_progress=ocr_job.set_progress,
+        )
+        with ocr_job.lock:
+            ocr_job.output = str(report.get("output") or ocr.INDEX_NAME)
+            ocr_job.titled = ""
+    except Exception as exc:
+        with ocr_job.lock:
+            ocr_job.error = str(exc)
+        if str(exc) == "остановлено":
+            session.note("ocr_stopped")
+        else:
+            session.note("ocr_error", error=str(exc))
+    finally:
+        with ocr_job.lock:
+            ocr_job.running = False
+
+
 # Поллинг UI и MJPEG — иначе консоль run.cmd забивается каждые ~700 мс.
 _QUIET_ACCESS_LOG = ("/api/status", "/api/preview")
 _CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
@@ -1048,7 +1190,25 @@ class Handler(BaseHTTPRequestHandler):
                 "video": kvm.video_override(),
             }
             st["default_scans"] = str(DEFAULT_SCANS)
+            st["ocr"] = ocr_job.status()
+            if session.dir is not None and not st["ocr"]["output"]:
+                if (session.dir / ocr.INDEX_NAME).is_file():
+                    st["ocr"]["output"] = ocr.INDEX_NAME
+                elif (session.dir / ocr.OUTPUT_NAME).is_file():
+                    st["ocr"]["output"] = ocr.OUTPUT_NAME
             return self._json(st)
+        if path == "/api/ocr/result":
+            if session.dir is None:
+                return self._json({"error": "нет сессии"}, 404)
+            preferred = ocr_job.titled or ocr_job.output or ocr.INDEX_NAME
+            target = session.dir / Path(preferred).name
+            if not target.is_file():
+                target = session.dir / ocr.INDEX_NAME
+            if not target.is_file():
+                target = session.dir / ocr.OUTPUT_NAME
+            if not target.is_file():
+                return self._json({"error": "нет индекса"}, 404)
+            return self._file(target, "text/markdown; charset=utf-8")
         if path == "/api/preview.jpg":
             jpeg = kvm.latest_jpeg
             if not jpeg:
@@ -1082,6 +1242,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             if path == "/api/shutdown":
                 session.auto_stop.set()
+                ocr_job.stop.set()
                 session.note("shutdown")
 
                 def _stop() -> None:
@@ -1142,6 +1303,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             if path == "/api/auto/stop":
                 session.auto_stop.set()
+                ocr_job.stop.set()
+                return self._json({"ok": True})
+            if path == "/api/ocr/start":
+                if session.dir is None:
+                    ensure_session(body)
+                if session.dir is not None and not session.pages:
+                    existing, created = pages_from_folder(session.dir)
+                    if existing:
+                        with session.lock:
+                            session.pages = existing
+                            if created:
+                                session.created = created
+                if session.auto_running:
+                    return self._json({"ok": False, "error": "дождитесь конца автоскана"}, 409)
+                if ocr_job.running:
+                    return self._json({"ok": True, "already": True})
+                if not session.pages:
+                    session.note("ocr_error", error="нет страниц для распознавания")
+                    return self._json({"ok": False, "error": "нет страниц для распознавания"}, 400)
+                ocr_job.reset()
+                threading.Thread(target=ocr_loop, daemon=True).start()
+                return self._json({"ok": True})
+            if path == "/api/ocr/stop":
+                ocr_job.stop.set()
                 return self._json({"ok": True})
             self._json({"error": "not found"}, 404)
         except Exception as exc:
