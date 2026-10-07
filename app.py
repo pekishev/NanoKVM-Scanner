@@ -49,6 +49,13 @@ DEFAULT_CROP = {"top": 0.10, "right": 0.0, "bottom": 0.05, "left": 0.32}
 MAX_SIDE_CROP = 0.95
 MIN_KEEP = 0.04
 
+# Сравнение кадров: бинарная карта чернил, не среднее серое 48×48.
+# На белом фоне с кодом/диффом даунскейл в серое сглаживает буквы в одинаковую кашу.
+SIG_WIDTH = 256
+SIG_HEIGHT = 144
+INK_WHITE_ABOVE = 200
+DEFAULT_DUPLICATE_THRESHOLD = 0.988
+
 # NanoKVM Pro: POST /api/stream/quality, 100 = пункт «Без потерь» для MJPEG.
 # Текущий видеорежим API не отдаёт. После загрузки сервер и веб-клиент ставят h264-webrtc.
 LOSSLESS_QUALITY = 100
@@ -141,18 +148,21 @@ def json_bytes(payload: Any, status: int = 200) -> tuple[int, bytes, str]:
     return status, body, "application/json; charset=utf-8"
 
 
-def frame_sig(jpeg: bytes, size: int = 48) -> bytes | None:
+def frame_sig(jpeg: bytes, width: int = SIG_WIDTH, height: int = SIG_HEIGHT) -> bytes | None:
+    """Карта чернил 0/1. Буквы остаются точками, а не серым пятном."""
     if Image is None:
         return None
-    img = Image.open(io.BytesIO(jpeg)).convert("L").resize((size, size), Image.BILINEAR)
-    return bytes(img.getdata())
+    img = Image.open(io.BytesIO(jpeg)).convert("L")
+    img = img.resize((width, height), Image.Resampling.LANCZOS)
+    return bytes(0 if pixel > INK_WHITE_ABOVE else 1 for pixel in img.getdata())
 
 
 def similarity(a: bytes | None, b: bytes | None) -> float:
+    """Доля совпавших пикселей карты чернил (1 = кадры одинаковые)."""
     if not a or not b or len(a) != len(b):
         return 0.0
-    diff = sum(abs(x - y) for x, y in zip(a, b))
-    return 1.0 - diff / (len(a) * 255.0)
+    mismatched = sum(x ^ y for x, y in zip(a, b))
+    return 1.0 - mismatched / len(a)
 
 
 def _fit_crop_axis(lo: float, hi: float) -> tuple[float, float]:
@@ -702,7 +712,7 @@ class ScanSession:
         self.delay_ms = 900
         self.max_pages = 300
         self.stop_on_duplicate = True
-        self.duplicate_threshold = 0.988
+        self.duplicate_threshold = DEFAULT_DUPLICATE_THRESHOLD
         self.crop = dict(DEFAULT_CROP)
         self.auto_running = False
         self.auto_stop = threading.Event()
@@ -738,7 +748,7 @@ class ScanSession:
             self.delay_ms = int(settings.get("delay_ms") or 900)
             self.max_pages = int(settings.get("max_pages") or 300)
             self.stop_on_duplicate = bool(settings.get("stop_on_duplicate", True))
-            self.duplicate_threshold = float(settings.get("duplicate_threshold") or 0.988)
+            self.duplicate_threshold = float(settings.get("duplicate_threshold") or DEFAULT_DUPLICATE_THRESHOLD)
             self.crop = parse_crop(settings.get("crop"))
             self.last_hash = None
         self._write_sidecar()
@@ -834,7 +844,7 @@ def apply_scan_settings(body: dict[str, Any]) -> None:
     if "stop_on_duplicate" in body:
         session.stop_on_duplicate = bool(body["stop_on_duplicate"])
     if "duplicate_threshold" in body:
-        session.duplicate_threshold = float(body["duplicate_threshold"] or 0.988)
+        session.duplicate_threshold = float(body["duplicate_threshold"] or DEFAULT_DUPLICATE_THRESHOLD)
     if "crop" in body:
         session.crop = parse_crop(body.get("crop"))
 
