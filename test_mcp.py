@@ -1,17 +1,19 @@
-"""MCP-инструменты ходят в локальный сканер: короткий набор, снимок, ошибки."""
+"""Сканер ходит в MCP NanoKVM-Pro за набором; снимок и клик — свой HTTP."""
 
 from __future__ import annotations
 
 import io
+import json
 import threading
+import time
 import unittest
-from http.server import ThreadingHTTPServer
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image
 
 import app
-import layout_type
-import mcp_server
 import ocr
 
 
@@ -21,9 +23,9 @@ class ScannerApiTests(unittest.TestCase):
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
         cls.httpd.daemon_threads = True
         cls.port = cls.httpd.server_address[1]
+        cls.base = f"http://127.0.0.1:{cls.port}"
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
-        mcp_server.SCANNER = f"http://127.0.0.1:{cls.port}"
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -45,10 +47,32 @@ class ScannerApiTests(unittest.TestCase):
             app.type_job.sent = 0
             app.type_job.total = 0
             app.type_job._text = ""
+            app.type_job.error = ""
+
+    def _json(self, method: str, path: str, body: dict | None = None) -> dict:
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        headers = {"Accept": "application/json"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            payload = json.loads(exc.read().decode("utf-8"))
+            payload["_http"] = exc.code
+        if not isinstance(payload, dict):
+            self.fail(f"не JSON: {payload!r}")
+        return payload
+
+    def _bytes(self, path: str) -> bytes:
+        req = urllib.request.Request(self.base + path, headers={"Accept": "image/jpeg"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.read()
 
     def test_type_status_reports_current_line(self) -> None:
         job = app.type_job
-        job.begin("alpha\nbeta\ngamma", "en", [])
+        job.begin("alpha\nbeta\ngamma", "en")
         try:
             with job.lock:
                 job.sent = 6
@@ -65,23 +89,28 @@ class ScannerApiTests(unittest.TestCase):
                 job.sent = 0
                 job.total = 0
 
-    def test_short_text_rejects_kilobytes(self) -> None:
-        with self.assertRaises(mcp_server.ScannerError) as caught:
-            mcp_server._type_keys("a" * (layout_type.KEY_TYPE_MAX + 1), "en")
-        self.assertEqual(caught.exception.payload.get("error"), "too_long")
+    def test_progress_stays_on_first_line(self) -> None:
+        self.assertEqual(app.progress_at("hello\nworld", 3), (1, 2, "hello"))
+        self.assertEqual(app.progress_at("hello\nworld", 6), (2, 2, "world"))
+        self.assertEqual(app.progress_at("a\n\nb", 2), (2, 3, ""))
+        self.assertEqual(app.progress_at("", 0), (1, 1, ""))
+        self.assertEqual(app.progress_at("a\r\nb", 1), (1, 2, "a"))
+        self.assertEqual(app.progress_at("a\r\nb", 3), (2, 2, "b"))
 
-    def test_short_text_skips_copyright_without_kvm(self) -> None:
-        result = mcp_server._type_keys("©", "en")
-        self.assertEqual(result.get("sent"), 1)
+    def test_short_text_rejects_kilobytes(self) -> None:
+        payload = self._json("POST", "/api/type/keys", {"text": "a" * (app.KEY_TYPE_MAX + 1), "layout": "en"})
+        self.assertEqual(payload.get("error"), "too_long")
+        self.assertEqual(payload.get("_http"), 400)
 
     def test_short_text_needs_kvm(self) -> None:
-        with self.assertRaises(mcp_server.ScannerError) as caught:
-            mcp_server._type_keys("hi", "en")
-        self.assertIn("NanoKVM", str(caught.exception))
+        payload = self._json("POST", "/api/type/keys", {"text": "hi", "layout": "en"})
+        self.assertIn("NanoKVM", str(payload.get("error") or ""))
 
     def test_screenshot_without_frame(self) -> None:
-        with self.assertRaises(mcp_server.ScannerError):
-            mcp_server._screenshot()
+        req = urllib.request.Request(self.base + "/api/screenshot.jpg")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(req, timeout=15)
+        self.assertEqual(caught.exception.code, 503)
 
     def test_screenshot_full_and_region(self) -> None:
         img = Image.new("RGB", (100, 40), "white")
@@ -90,71 +119,44 @@ class ScannerApiTests(unittest.TestCase):
         img.save(buf, format="JPEG", quality=95)
         app.kvm.latest_jpeg = buf.getvalue()
 
-        full, note = mcp_server._screenshot()
+        full = self._bytes("/api/screenshot.jpg")
         self.assertTrue(full.startswith(b"\xff\xd8"))
-        self.assertIn("весь экран", note)
-        self.assertIn("100×40", note)
-        self.assertIn("пиксели", note)
 
-        part, part_note = mcp_server._screenshot(0, 0, 25, 40)
+        part = self._bytes("/api/screenshot.jpg?x=0&y=0&w=25&h=40&px=1")
         self.assertTrue(part.startswith(b"\xff\xd8"))
-        self.assertIn("25×40", part_note)
-        self.assertIn("x=0 y=0", part_note)
         self.assertLess(len(part), len(full))
-        shown = mcp_server.screenshot(0, 0, 25, 40)
-        self.assertIsInstance(shown[1], mcp_server.Image)
 
     def test_region_outside_frame(self) -> None:
         img = Image.new("RGB", (100, 40), "white")
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=95)
         app.kvm.latest_jpeg = buf.getvalue()
-        with self.assertRaises(mcp_server.ScannerError) as caught:
-            mcp_server._screenshot(50, 20, 80, 32)
-        self.assertIn("вне кадра", str(caught.exception))
-
-    def test_tools_are_registered(self) -> None:
-        import asyncio
-
-        tools = asyncio.run(mcp_server.mcp.list_tools())
-        self.assertEqual(
-            {tool.name for tool in tools},
-            {
-                "type_text",
-                "type_keys",
-                "screenshot",
-                "click",
-                "press",
-                "status",
-                "connect",
-                "read_terminal",
-            },
-        )
+        req = urllib.request.Request(self.base + "/api/screenshot.jpg?x=50&y=20&w=80&h=32&px=1")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(req, timeout=15)
+        self.assertEqual(caught.exception.code, 400)
+        payload = json.loads(caught.exception.read().decode("utf-8"))
+        self.assertIn("вне кадра", str(payload.get("error") or ""))
 
     def test_click_rejects_bad_point(self) -> None:
         img = Image.new("RGB", (100, 40), "white")
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=95)
         app.kvm.latest_jpeg = buf.getvalue()
-        with self.assertRaises(mcp_server.ScannerError) as caught:
-            mcp_server._click(150, 10, "left")
-        self.assertIn("вне кадра", str(caught.exception))
-        with self.assertRaises(mcp_server.ScannerError):
-            mcp_server._click(10, 10, "other")
+        payload = self._json("POST", "/api/click", {"x": 150, "y": 10, "px": True})
+        self.assertIn("вне кадра", str(payload.get("error") or ""))
 
     def test_click_needs_frame(self) -> None:
-        with self.assertRaises(mcp_server.ScannerError) as caught:
-            mcp_server._click(40, 20, "left")
-        self.assertIn("кадр", str(caught.exception).lower())
+        payload = self._json("POST", "/api/click", {"x": 40, "y": 20, "px": True})
+        self.assertIn("кадр", str(payload.get("error") or "").lower())
 
     def test_click_needs_kvm(self) -> None:
         img = Image.new("RGB", (100, 40), "white")
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=95)
         app.kvm.latest_jpeg = buf.getvalue()
-        with self.assertRaises(mcp_server.ScannerError) as caught:
-            mcp_server._click(40, 24, "right")
-        self.assertIn("HID", str(caught.exception))
+        payload = self._json("POST", "/api/click", {"x": 40, "y": 24, "button": 2, "px": True})
+        self.assertIn("HID", str(payload.get("error") or ""))
 
     def test_click_maps_pixel_center(self) -> None:
         img = Image.new("RGB", (100, 40), "white")
@@ -170,7 +172,7 @@ class ScannerApiTests(unittest.TestCase):
 
         app.kvm.click_norm = fake  # type: ignore[method-assign]
         try:
-            result = mcp_server._click(25, 10, "left")
+            result = self._json("POST", "/api/click", {"x": 25, "y": 10, "px": True, "button": 0})
         finally:
             app.kvm.click_norm = original  # type: ignore[method-assign]
         self.assertEqual(seen["xy"], (25.5 / 100, 10.5 / 40))
@@ -181,41 +183,40 @@ class ScannerApiTests(unittest.TestCase):
         self.assertEqual(result["frame_height"], 40)
 
     def test_press_unknown_key(self) -> None:
-        with self.assertRaises(mcp_server.ScannerError) as caught:
-            mcp_server._press("Ctrl+Nope")
-        self.assertIn("неизвестная", str(caught.exception))
+        payload = self._json("POST", "/api/press", {"keys": "Ctrl+Nope"})
+        self.assertEqual(payload.get("error"), "bad_keys")
+        self.assertIn("неизвестная", str(payload.get("msg") or ""))
 
     def test_press_needs_kvm(self) -> None:
-        with self.assertRaises(mcp_server.ScannerError) as caught:
-            mcp_server._press("Ctrl+C")
-        self.assertIn("NanoKVM", str(caught.exception))
+        payload = self._json("POST", "/api/press", {"keys": "Ctrl+C"})
+        self.assertIn("NanoKVM", str(payload.get("error") or ""))
 
     def test_status_reports_frame_pixels(self) -> None:
         img = Image.new("RGB", (1920, 1080), "white")
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=95)
         app.kvm.latest_jpeg = buf.getvalue()
-        st = mcp_server._status()
-        self.assertTrue(st["has_frame"])
-        self.assertEqual(st["frame_width"], 1920)
-        self.assertEqual(st["frame_height"], 1080)
+        st = self._json("GET", "/api/status")
+        kvm = st.get("kvm") or {}
+        self.assertTrue(kvm["has_frame"])
+        self.assertEqual(kvm["frame_width"], 1920)
+        self.assertEqual(kvm["frame_height"], 1080)
 
     def test_web_click_still_uses_fractions(self) -> None:
         self.assertEqual(app.click_xy({"x": 0.4, "y": 0.6}), (0.4, 0.6))
 
     def test_status_reports_disconnected(self) -> None:
-        st = mcp_server._status()
-        self.assertFalse(st["connected"])
-        self.assertFalse(st["has_frame"])
-        self.assertEqual(st["frame_width"], 0)
-        self.assertEqual(st["frame_height"], 0)
-        self.assertEqual(st["layout"], "en")
-        self.assertEqual(st["url"], "")
+        st = self._json("GET", "/api/status")
+        kvm = st.get("kvm") or {}
+        self.assertFalse(kvm["connected"])
+        self.assertFalse(kvm["has_frame"])
+        self.assertEqual(kvm["frame_width"], 0)
+        self.assertEqual(kvm["frame_height"], 0)
+        self.assertEqual(kvm["url"], "")
 
     def test_connect_without_saved_url(self) -> None:
-        with self.assertRaises(mcp_server.ScannerError) as caught:
-            mcp_server._connect(wait_s=0)
-        self.assertIn("адреса", str(caught.exception))
+        payload = self._json("POST", "/api/connect", {})
+        self.assertIn("адреса", str(payload.get("error") or ""))
 
     def test_connect_reuses_last_credentials(self) -> None:
         captured: dict = {}
@@ -231,33 +232,80 @@ class ScannerApiTests(unittest.TestCase):
         original = app.kvm.connect
         app.kvm.connect = fake_connect  # type: ignore[method-assign]
         try:
-            st = mcp_server._connect(wait_s=0)
+            st = self._json("POST", "/api/connect", {})
         finally:
             app.kvm.connect = original  # type: ignore[method-assign]
         self.assertEqual(captured["args"], ("https://10.0.0.1", "admin", "secret"))
-        self.assertTrue(st["connected"])
+        self.assertTrue(st["ok"])
         self.assertEqual(st["url"], "https://10.0.0.1")
 
-    def test_quotes_go_out_as_hid_shift_quote(self) -> None:
-        reports: list[tuple[int, int]] = []
-        original_report = app.kvm.keyboard_report
-        original_alt = app.kvm.alt_shift
+    def test_quotes_go_to_pro_mcp(self) -> None:
+        captured: dict = {}
+
+        def fake_mcp(name: str, arguments: dict | None = None, timeout: float = 30) -> dict:
+            captured["name"] = name
+            captured["arguments"] = arguments or {}
+            captured["timeout"] = timeout
+            return {"ok": True, "sent": 13, "layout": "en"}
+
+        original = app.kvm.mcp_call
         app.kvm.connected = True
-        app.kvm.keyboard_report = lambda modifier=0, keycode=0: reports.append((modifier, keycode))
-        app.kvm.alt_shift = lambda: None
+        app.kvm.mcp_call = fake_mcp  # type: ignore[method-assign]
         try:
             result = app.type_keys_now('grep "Failed"', "en")
         finally:
-            app.kvm.keyboard_report = original_report
-            app.kvm.alt_shift = original_alt
+            app.kvm.mcp_call = original  # type: ignore[method-assign]
             app.kvm.connected = False
+        self.assertEqual(captured["name"], "type_keys")
+        self.assertEqual(captured["arguments"]["text"], 'grep "Failed"')
+        self.assertEqual(captured["arguments"]["layout"], "en")
         self.assertEqual(result["sent"], 13)
-        self.assertIn((2, 52), reports)
+
+    def test_type_start_uses_type_text(self) -> None:
+        captured: dict = {}
+        started = threading.Event()
+
+        def fake_mcp(name: str, arguments: dict | None = None, timeout: float = 30) -> dict:
+            captured.setdefault("calls", []).append((name, arguments or {}))
+            if name == "type_text":
+                started.set()
+                return {"ok": True, "sent": 5, "layout": "ru"}
+            if name == "status":
+                return {"ok": True, "type_running": True, "type_sent": 2, "type_total": 5, "layout": "en"}
+            return {"ok": True}
+
+        original = app.kvm.mcp_call
+        app.kvm.connected = True
+        app.kvm.mcp_call = fake_mcp  # type: ignore[method-assign]
+        try:
+            payload = self._json("POST", "/api/type/start", {"text": "hello", "layout": "en"})
+            self.assertTrue(payload.get("ok"))
+            self.assertTrue(started.wait(2))
+            running = True
+            layout = "en"
+            sent = 0
+            for _ in range(50):
+                with app.type_job.lock:
+                    running = app.type_job.running
+                    layout = app.type_job.layout
+                    sent = app.type_job.sent
+                if not running:
+                    break
+                time.sleep(0.05)
+        finally:
+            app.kvm.mcp_call = original  # type: ignore[method-assign]
+            app.kvm.connected = False
+            with app.type_job.lock:
+                app.type_job.running = False
+        self.assertFalse(running)
+        self.assertEqual(layout, "ru")
+        self.assertEqual(sent, 5)
+        self.assertEqual(captured["calls"][0][0], "type_text")
+        self.assertEqual(captured["calls"][0][1]["text"], "hello")
 
     def test_read_terminal_without_frame(self) -> None:
-        with self.assertRaises(mcp_server.ScannerError) as caught:
-            mcp_server._read_terminal()
-        self.assertIn("no frame", str(caught.exception).lower())
+        payload = self._json("POST", "/api/read_terminal", {})
+        self.assertIn("no frame", str(payload.get("error") or "").lower())
 
     def test_read_terminal_uses_last_region(self) -> None:
         img = Image.new("RGB", (100, 40), "white")
@@ -265,7 +313,7 @@ class ScannerApiTests(unittest.TestCase):
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=95)
         app.kvm.latest_jpeg = buf.getvalue()
-        mcp_server._screenshot(0, 0, 25, 40)
+        self._bytes("/api/screenshot.jpg?x=0&y=0&w=25&h=40&px=1")
         original = ocr.ollama_ocr_image
 
         def fake_ocr(png: bytes, **kwargs: object) -> str:
@@ -274,13 +322,92 @@ class ScannerApiTests(unittest.TestCase):
 
         ocr.ollama_ocr_image = fake_ocr  # type: ignore[assignment]
         try:
-            result = mcp_server._read_terminal()
+            result = self._json("POST", "/api/read_terminal", {"px": True})
         finally:
             ocr.ollama_ocr_image = original  # type: ignore[assignment]
         self.assertEqual(result["text"], "FAIL: boom\n\"Failed\"")
         self.assertEqual(result["box"], [0, 0, 25, 40])
         self.assertEqual(result["frame_width"], 100)
         self.assertEqual(result["frame_height"], 40)
+
+
+class FakeProHandler(BaseHTTPRequestHandler):
+    calls: list[tuple[str, dict]] = []
+    replies: dict[str, dict | str] = {}
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        return
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        req = json.loads(raw.decode("utf-8"))
+        params = req.get("params") or {}
+        name = str(params.get("name") or "")
+        arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        self.calls.append((name, arguments))
+        reply = self.replies.get(name, {"ok": True})
+        if isinstance(reply, str):
+            result = {"content": [{"type": "text", "text": reply}], "isError": True}
+        else:
+            result = {"content": [{"type": "text", "text": json.dumps(reply, ensure_ascii=False)}]}
+        body = json.dumps({"jsonrpc": "2.0", "id": req.get("id"), "result": result}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class ProMcpClientTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        FakeProHandler.calls = []
+        FakeProHandler.replies = {}
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), FakeProHandler)
+        cls.httpd.daemon_threads = True
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=3)
+
+    def setUp(self) -> None:
+        FakeProHandler.calls = []
+        FakeProHandler.replies = {
+            "type_keys": {"ok": True, "sent": 2, "layout": "en"},
+            "status": {"ok": True, "connected": True, "layout": "en"},
+        }
+        app.kvm.connected = True
+        app.kvm.base_url = f"http://127.0.0.1:{self.port}"
+        app.kvm.token = "test-token"
+
+    def tearDown(self) -> None:
+        app.kvm.connected = False
+        app.kvm.base_url = ""
+        app.kvm.token = ""
+
+    def test_mcp_call_posts_to_device(self) -> None:
+        result = app.kvm.mcp_call("type_keys", {"text": "hi", "layout": "en"})
+        self.assertEqual(result["sent"], 2)
+        self.assertEqual(FakeProHandler.calls, [("type_keys", {"text": "hi", "layout": "en"})])
+
+    def test_mcp_call_raises_tool_error(self) -> None:
+        FakeProHandler.replies["type_keys"] = "keyboard is busy"
+        with self.assertRaises(RuntimeError) as caught:
+            app.kvm.mcp_call("type_keys", {"text": "hi", "layout": "en"})
+        self.assertIn("busy", str(caught.exception).lower())
+
+    def test_mcp_call_needs_connection(self) -> None:
+        app.kvm.connected = False
+        with self.assertRaises(RuntimeError) as caught:
+            app.kvm.mcp_call("status")
+        self.assertIn("NanoKVM", str(caught.exception))
 
 
 if __name__ == "__main__":

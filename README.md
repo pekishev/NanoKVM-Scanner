@@ -12,6 +12,10 @@ Captures pages from a remote computer through **NanoKVM Pro** (MJPEG + HID keybo
 
 The device must be in **MJPEG** mode. On the remote PC, open the document fullscreen (F11) and click into the article so Page Down scrolls it.
 
+## MCP (agent keyboard / screenshot)
+
+Cursor talks to **NanoKVM-Pro** on the device: `https://<kvm>/mcp` (see `.cursor/mcp.json`). Tools: `status`, `screenshot`, `click`, `type_keys`, `type_text`, `press`, `stop_type`. The scanner UI “Type” box uses the same MCP after Connect. Do not run a local MCP on port 8766.
+
 ## Run
 
 Python 3.10+ is required.

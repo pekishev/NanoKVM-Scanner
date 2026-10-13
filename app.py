@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Any
 
 import hotkeys
-import layout_type
 import ocr
 
 try:
@@ -47,6 +46,7 @@ STATIC_DIR = ROOT / "static"
 DEFAULT_SCANS = ROOT / "scans"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 8765
+KEY_TYPE_MAX = 200
 
 # Доля кадра: вкладки+адресная строка сверху, панель задач снизу (замер 1920x1080).
 DEFAULT_CROP = {"top": 0.10, "right": 0.0, "bottom": 0.05, "left": 0.32}
@@ -409,6 +409,58 @@ class KvmClient:
             raise RuntimeError(f"{path}: неожиданный ответ")
         if data.get("code", 0) not in (0, None):
             raise RuntimeError(data.get("msg") or f"{path}: ошибка")
+        return data
+
+    def mcp_call(
+        self, name: str, arguments: dict[str, Any] | None = None, timeout: float = 30
+    ) -> dict[str, Any]:
+        """Вызов инструмента MCP NanoKVM-Pro на самом устройстве (`POST /mcp`)."""
+        if not self.connected or not self.base_url:
+            raise RuntimeError("нет связи с NanoKVM")
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments or {}},
+        }
+        headers = self.headers()
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
+        req = urllib.request.Request(
+            self.base_url + "/mcp",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, context=SSL_CTX, timeout=timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            raise RuntimeError(f"MCP {name} HTTP {exc.code}: {detail}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"MCP {name}: {exc}") from exc
+        if not isinstance(body, dict):
+            raise RuntimeError(f"MCP {name}: неожиданный ответ")
+        err = body.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            raise RuntimeError(str(err["message"]))
+        result = body.get("result") if isinstance(body.get("result"), dict) else {}
+        texts = [
+            str(item.get("text") or "")
+            for item in (result.get("content") or [])
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        if result.get("isError"):
+            raise RuntimeError(texts[0] if texts else f"MCP {name}")
+        if not texts:
+            return {"ok": True}
+        try:
+            data = json.loads(texts[0])
+        except json.JSONDecodeError:
+            return {"ok": True, "text": texts[0]}
+        if not isinstance(data, dict):
+            return {"ok": True, "value": data}
         return data
 
     def keyboard_report(self, modifier: int = 0, keycode: int = 0) -> None:
@@ -1016,10 +1068,9 @@ class TypeJob:
         self.total = 0
         self.error = ""
         self.seq = 0
-        self._segments: list[layout_type.Segment] = []
         self._text = ""
 
-    def begin(self, text: str, layout: str, segments: list[layout_type.Segment]) -> None:
+    def begin(self, text: str, layout: str) -> None:
         with self.lock:
             self.running = True
             self.stop.clear()
@@ -1028,12 +1079,11 @@ class TypeJob:
             self.total = len(text)
             self.seq += 1
             self.error = ""
-            self._segments = segments
             self._text = text
 
     def status(self) -> dict[str, Any]:
         with self.lock:
-            line, lines, line_text = layout_type.progress_at(self._text, self.sent)
+            line, lines, line_text = progress_at(self._text, self.sent)
             return {
                 "running": self.running,
                 "layout": self.layout,
@@ -1057,9 +1107,18 @@ def remember_frame_box(box: tuple[float, float, float, float] | None) -> None:
     last_frame_box = box
 
 
-# 12 мс удержание + 13 мс пауза ≈ 40 символов/с. Paste NanoKVM — 50 мс и без кавычек.
-KEY_HOLD_S = 0.012
-KEY_GAP_S = 0.013
+def progress_at(text: str, sent: int) -> tuple[int, int, str]:
+    """Номер текущей строки (с 1), всего строк и её текст по числу напечатанных символов."""
+    if not text:
+        return 1, 1, ""
+    pos = min(max(int(sent), 0), len(text))
+    line = text.count("\n", 0, pos) + 1
+    lines = text.count("\n") + 1
+    start = text.rfind("\n", 0, pos) + 1
+    end = text.find("\n", pos)
+    if end < 0:
+        end = len(text)
+    return line, lines, text[start:end].replace("\r", "")
 
 
 def _layout_name(value: Any) -> str:
@@ -1067,6 +1126,19 @@ def _layout_name(value: Any) -> str:
     if layout not in ("en", "ru"):
         raise RuntimeError("неизвестная раскладка")
     return layout
+
+
+def _mcp_busy(exc: BaseException) -> bool:
+    return "busy" in str(exc).lower()
+
+
+def _mcp_stop() -> None:
+    if not kvm.connected:
+        return
+    try:
+        kvm.mcp_call("stop_type", timeout=8)
+    except Exception:
+        pass
 
 
 def type_loop() -> None:
@@ -1082,67 +1154,43 @@ def type_loop() -> None:
         hid_type_lock.release()
 
 
-def _hid_char(ch: str) -> None:
-    modifier, code = layout_type.us_hid(ch)
-    kvm.keyboard_report(modifier, code)
-    time.sleep(KEY_HOLD_S)
-    kvm.keyboard_report(0)
-    time.sleep(KEY_GAP_S)
-
-
-def _type_segments(
-    segments: list[layout_type.Segment],
-    layout: str,
-    *,
-    stop: threading.Event | None = None,
-    on_progress: Any | None = None,
-) -> tuple[int, str, bool]:
-    current = layout
-    sent = 0
-    for segment in segments:
-        if (stop and stop.is_set()) or not kvm.connected:
-            return sent, current, True
-        if segment.layout != current:
-            kvm.alt_shift()
-            time.sleep(0.1)
-            current = segment.layout
-            session.note("type_switch", layout=current)
-            if on_progress:
-                on_progress(sent, current)
-        for ch, index in zip(segment.keys, segment.src):
-            if (stop and stop.is_set()) or not kvm.connected:
-                return sent, current, True
-            _hid_char(ch)
-            sent = index + 1
-            if on_progress and (sent % 8 == 0 or ch == "\n"):
-                on_progress(sent, current)
-    return sent, current, False
+def _poll_type_status(stop: threading.Event) -> None:
+    while not stop.wait(0.4):
+        try:
+            st = kvm.mcp_call("status", timeout=10)
+        except Exception:
+            continue
+        with type_job.lock:
+            if not type_job.running:
+                return
+            type_job.sent = int(st.get("type_sent") or type_job.sent)
+            layout = st.get("layout")
+            if layout in ("en", "ru"):
+                type_job.layout = layout
 
 
 def _type_long() -> None:
     sent = 0
-    stopped = False
     try:
         with type_job.lock:
-            segments = list(type_job._segments)
             layout = type_job.layout
             text = type_job._text
         session.note("type_started", chars=len(text), layout=layout)
-
-        def progress(done: int, current: str) -> None:
-            with type_job.lock:
-                type_job.sent = done
-                type_job.layout = current
-
-        sent, current, stopped = _type_segments(
-            segments, layout, stop=type_job.stop, on_progress=progress
-        )
-        if not stopped:
-            sent = len(text)
+        stop_poll = threading.Event()
+        poller = threading.Thread(target=_poll_type_status, args=(stop_poll,), daemon=True)
+        poller.start()
+        timeout = max(45.0, len(text) * 0.04 + 12)
+        try:
+            result = kvm.mcp_call("type_text", {"text": text, "layout": layout}, timeout=timeout)
+        finally:
+            stop_poll.set()
+            poller.join(timeout=1)
+        sent = int(result.get("sent") or 0)
+        current = result.get("layout") if result.get("layout") in ("en", "ru") else layout
         with type_job.lock:
             type_job.sent = sent
             type_job.layout = current
-        if stopped:
+        if result.get("stopped"):
             session.note("type_stopped", sent=sent, total=len(text))
         else:
             session.note("type_done", sent=sent)
@@ -1152,41 +1200,35 @@ def _type_long() -> None:
             type_job.sent = sent
         session.note("type_error", error=str(exc))
     finally:
-        try:
-            kvm.keyboard_report(0)
-        except Exception:
-            pass
         with type_job.lock:
             type_job.running = False
 
 
 def type_keys_now(text: str, layout: str) -> dict[str, Any]:
-    """Короткий текст отдельными HID-отчётами."""
-    if len(text) > layout_type.KEY_TYPE_MAX:
+    """Короткий текст через MCP NanoKVM-Pro (`type_keys`)."""
+    if len(text) > KEY_TYPE_MAX:
         raise RuntimeError("too_long")
-    segments = layout_type.plan_paste(text, layout)
-    if not any(segment.keys for segment in segments):
-        return {"sent": len(text), "layout": layout}
+    if not text:
+        return {"sent": 0, "layout": layout}
     if not kvm.connected:
         raise RuntimeError("нет связи с NanoKVM")
     if type_job.running or not hid_type_lock.acquire(blocking=False):
         raise RuntimeError("busy")
     try:
-        if type_job.running or not kvm.connected:
-            raise RuntimeError("busy" if type_job.running else "нет связи с NanoKVM")
         session.note("type_keys", chars=len(text), layout=layout)
-        sent, current, stopped = _type_segments(segments, layout)
-        if not stopped:
-            sent = len(text)
+        timeout = max(20.0, len(text) * 0.05 + 5)
+        result = kvm.mcp_call("type_keys", {"text": text, "layout": layout}, timeout=timeout)
+        current = result.get("layout") if result.get("layout") in ("en", "ru") else layout
+        sent = int(result.get("sent") or 0)
         with type_job.lock:
             type_job.layout = current
         session.note("type_keys_done", sent=sent, layout=current)
         return {"sent": sent, "layout": current}
+    except RuntimeError as exc:
+        if _mcp_busy(exc):
+            raise RuntimeError("busy") from exc
+        raise
     finally:
-        try:
-            kvm.keyboard_report(0)
-        except Exception:
-            pass
         hid_type_lock.release()
 
 
@@ -1675,12 +1717,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "url": kvm.base_url})
             if path == "/api/disconnect":
                 type_job.stop.set()
+                _mcp_stop()
                 kvm.disconnect()
                 return self._json({"ok": True})
             if path == "/api/shutdown":
                 session.auto_stop.set()
                 ocr_job.stop.set()
                 type_job.stop.set()
+                _mcp_stop()
                 session.note("shutdown")
 
                 def _stop() -> None:
@@ -1798,16 +1842,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/type/keys":
                 text = str(body.get("text") or "")
                 layout = _layout_name(body.get("layout"))
-                if len(text) > layout_type.KEY_TYPE_MAX:
+                if len(text) > KEY_TYPE_MAX:
                     return self._json(
-                        {"ok": False, "error": "too_long", "max": layout_type.KEY_TYPE_MAX},
+                        {"ok": False, "error": "too_long", "max": KEY_TYPE_MAX},
                         400,
                     )
                 try:
                     result = type_keys_now(text, layout)
-                except layout_type.BadChar as exc:
-                    session.note("type_bad_char", char=exc.char)
-                    return self._json({"ok": False, "error": "bad_char", "char": exc.char}, 400)
                 except RuntimeError as exc:
                     if str(exc) == "busy":
                         return self._json({"ok": False, "error": "busy"}, 409)
@@ -1831,22 +1872,18 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/type/start":
                 text = str(body.get("text") or "")
                 layout = _layout_name(body.get("layout"))
-                try:
-                    segments = layout_type.plan_paste(text, layout)
-                except layout_type.BadChar as exc:
-                    session.note("type_bad_char", char=exc.char)
-                    return self._json({"ok": False, "error": "bad_char", "char": exc.char}, 400)
                 if not kvm.connected:
                     raise RuntimeError("нет связи с NanoKVM")
                 if type_job.running:
                     return self._json({"ok": True, "already": True})
-                if not any(segment.keys for segment in segments):
+                if not text:
                     return self._json({"ok": True, "empty": True, "layout": layout})
-                type_job.begin(text, layout, segments)
+                type_job.begin(text, layout)
                 threading.Thread(target=type_loop, daemon=True).start()
                 return self._json({"ok": True, "layout": layout, "seq": type_job.status()["seq"]})
             if path == "/api/type/stop":
                 type_job.stop.set()
+                _mcp_stop()
                 return self._json({"ok": True})
             if path == "/api/type/altshift":
                 if not kvm.connected:
