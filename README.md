@@ -37,5 +37,7 @@ Default crop: **top 10%** (tabs), **left 32%**, **bottom 5%** (taskbar). Right 0
 Session folder:
 
 - `0001.jpg`, `0002.jpg`, …
+- `0001.md`, `0002.md`, … — recognized text of each frame
+- `_index.md` — table of contents: page → JPEG ↔ markdown
 - `manifest.json` — order and sizes
-- `OCR_PROMPT.md` — prompt for recognizing text from the frames
+- `OCR_PROMPT.md` — how to use the frames and recognized text

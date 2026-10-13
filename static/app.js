@@ -3,7 +3,7 @@ const $ = (id) => document.getElementById(id);
 const I18N = {
   ru: {
     language: "Язык",
-    tagline: "NanoKVM Pro · MJPEG → страницы → индекс файлов",
+    tagline: "NanoKVM Pro · MJPEG → страницы → JPEG ↔ markdown",
     noSignal: "нет сигнала",
     waitingFrame: "ждём кадр",
     hdmiLive: "HDMI live",
@@ -30,7 +30,7 @@ const I18N = {
     maxPages: "Макс. страниц",
     stopDup: "Стоп, если кадр совпадает с предыдущим",
     ocr: "Индекс",
-    ocrIntro: "По кадрам собирается список «страница → файл» (diff --git). Картинки остаются источником правды; индекс только для навигации.",
+    ocrIntro: "По кадрам распознаётся весь текст. Для каждой страницы сохраняется markdown рядом с JPEG; индекс связывает кадр и текст.",
     ocrRun: "Построить индекс",
     ocrStop: "Стоп",
     ocrOpen: "Открыть индекс",
@@ -53,7 +53,7 @@ const I18N = {
     stop: "Стоп",
     pageOnly: "Только листануть",
     pages: "Страницы",
-    folderHint: "После скана нажмите «Построить индекс» — получите страницу → файл. JPEG остаётся источником правды.",
+    folderHint: "После скана нажмите «Построить индекс» — получите JPEG ↔ markdown с текстом страницы.",
     folderReady: "Папка: {dir}",
     sessionPill: "{name} · {count} стр.",
     log_session: "сессия {name} -> {folder}",
@@ -99,7 +99,9 @@ const I18N = {
     typeMin: "~{min} мин",
     typeMinSec: "~{min} мин {sec} с",
     typeStats: "{lines} стр., {chars} симв., {time}",
-    typeProgress: "печатается {sent}/{total}",
+    typeProgress: "осталось {time} · {pct}%",
+    typeLine: "стр. {line}/{lines}: {preview}",
+    typeLineBlank: "стр. {line}/{lines}",
     typeBadChar: "Нельзя напечатать «{char}»",
     typeBusy: "Сначала дождитесь конца набора",
     log_type_started: "набор {chars} симв., раскладка {layout}",
@@ -110,10 +112,13 @@ const I18N = {
     log_type_bad_char: "нельзя напечатать «{char}»",
     log_type_altshift: "Alt+Shift → {layout}",
     log_type_enter: "Enter",
+    log_type_keys: "клавиши {chars} симв., раскладка {layout}",
+    log_type_keys_done: "клавиши напечатаны ({sent}), раскладка {layout}",
+    log_press: "нажато {keys}",
   },
   en: {
     language: "Language",
-    tagline: "NanoKVM Pro · MJPEG → pages → file index",
+    tagline: "NanoKVM Pro · MJPEG → pages → JPEG ↔ markdown",
     noSignal: "no signal",
     waitingFrame: "waiting for frame",
     hdmiLive: "HDMI live",
@@ -140,7 +145,7 @@ const I18N = {
     maxPages: "Max pages",
     stopDup: "Stop if the frame matches the previous one",
     ocr: "Index",
-    ocrIntro: "Builds a page → file list from GitLab diff headers. JPEGs stay the source of truth; the index is only for navigation.",
+    ocrIntro: "Transcribes the full page text. Each JPEG gets a matching markdown file; the index maps frame to text.",
     ocrRun: "Build index",
     ocrStop: "Stop",
     ocrOpen: "Open index",
@@ -163,7 +168,7 @@ const I18N = {
     stop: "Stop",
     pageOnly: "Page only",
     pages: "Pages",
-    folderHint: "After the scan, click Build index — you get page → file. JPEGs stay the source of truth.",
+    folderHint: "After the scan, click Build index — you get JPEG ↔ markdown with the page text.",
     folderReady: "Folder: {dir}",
     sessionPill: "{name} · {count} pages",
     log_session: "session {name} -> {folder}",
@@ -209,7 +214,9 @@ const I18N = {
     typeMin: "~{min} min",
     typeMinSec: "~{min} min {sec} s",
     typeStats: "{lines} lines, {chars} chars, {time}",
-    typeProgress: "typing {sent}/{total}",
+    typeProgress: "{time} left · {pct}%",
+    typeLine: "line {line}/{lines}: {preview}",
+    typeLineBlank: "line {line}/{lines}",
     typeBadChar: "Cannot type “{char}”",
     typeBusy: "Wait until typing finishes",
     log_type_started: "typing {chars} chars, layout {layout}",
@@ -220,6 +227,9 @@ const I18N = {
     log_type_bad_char: "cannot type “{char}”",
     log_type_altshift: "Alt+Shift → {layout}",
     log_type_enter: "Enter",
+    log_type_keys: "keys {chars} chars, layout {layout}",
+    log_type_keys_done: "keys typed ({sent}), layout {layout}",
+    log_press: "pressed {keys}",
   },
 };
 
@@ -253,6 +263,7 @@ const els = {
   typeText: $("type-text"),
   typeLayout: $("type-layout"),
   typeStats: $("type-stats"),
+  typeLine: $("type-line"),
   typeBtn: $("btn-type"),
   typeStop: $("btn-type-stop"),
   typeClear: $("btn-type-clear"),
@@ -809,7 +820,7 @@ $("btn-auto").onclick = withBusy(async () => {
   poll();
 });
 $("btn-stop").onclick = withBusy(() => api("/api/auto/stop", {}).then(poll));
-const TYPE_CPS = 20;
+const TYPE_CPS = 40;
 let typeOrigin = "";
 let typeWatch = 0;
 
@@ -822,8 +833,15 @@ function formatDuration(ms) {
   return rest ? t("typeMinSec", { min, sec: rest }) : t("typeMin", { min });
 }
 
+function clearTypeLine() {
+  els.typeLine.textContent = "";
+  els.typeLine.title = "";
+}
+
 function updateTypeStats() {
   const raw = els.typeText.value || "";
+  els.typeStats.title = "";
+  clearTypeLine();
   if (!raw) {
     els.typeStats.textContent = "";
     return;
@@ -834,6 +852,29 @@ function updateTypeStats() {
     chars: raw.length,
     time: formatDuration(sec * 1000),
   });
+}
+
+function clipTypeLine(text, limit = 80) {
+  const s = String(text || "").replace(/\s+/g, " ").trim();
+  if (s.length <= limit) return s;
+  return s.slice(0, limit - 1) + "…";
+}
+
+function formatTypeProgress(job) {
+  const sent = job.sent || 0;
+  const total = job.total || 0;
+  const remaining = Math.max(0, total - sent);
+  const time = formatDuration((remaining / TYPE_CPS) * 1000);
+  const pct = total > 0 ? Math.min(100, Math.round((sent / total) * 100)) : 0;
+  return t("typeProgress", { time, pct });
+}
+
+function formatTypeLine(job) {
+  const line = job.line || 1;
+  const lines = job.lines || 1;
+  const preview = clipTypeLine(job.line_text);
+  if (preview) return t("typeLine", { line, lines, preview });
+  return t("typeLineBlank", { line, lines });
 }
 
 function typeError(err) {
@@ -868,7 +909,10 @@ function syncType(st) {
   els.typeAlt.disabled = running;
   els.typeEnter.disabled = running;
   if (running) {
-    els.typeStats.textContent = t("typeProgress", { sent: job.sent || 0, total: job.total || 0 });
+    els.typeStats.textContent = formatTypeProgress(job);
+    els.typeStats.title = "";
+    els.typeLine.textContent = formatTypeLine(job);
+    els.typeLine.title = String(job.line_text || "");
   } else {
     updateTypeStats();
   }

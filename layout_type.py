@@ -1,8 +1,8 @@
 """План набора текста на удалённом ПК через NanoKVM.
 
-Как веб-клиент NanoKVM (paste): символ переводится в физическую US-клавишу
-текущей раскладки. Если её нет в этой раскладке, перед символом нужен Alt+Shift.
-POST /api/hid/paste принимает уже US-символы и сам жмёт HID.
+Символ переводится в физическую US-клавишу текущей раскладки.
+Если её нет в этой раскладке, перед символом нужен Alt+Shift.
+Набор идёт HID-отчётами: /api/hid/paste на устройстве молча пропускает кавычки.
 """
 
 from __future__ import annotations
@@ -10,8 +10,38 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # Сколько символов за один /api/hid/paste. На устройстве ~50 мс на символ,
-# а обработчик режет строку длиннее 1024 байт.
+# а обработчик режет строку длиннее 1024 байт. Длинный набор идёт HID-ом.
 PASTE_CHUNK = 40
+
+# Короткий набор шлётся нажатиями с нашего HID, без /api/hid/paste.
+KEY_TYPE_MAX = 200
+
+# То, что с клавиатуры не приходит: кавычки, пробелы, тире → ближайшая клавиша.
+CHAR_FOLD = {
+    "\u00ab": '"',
+    "\u00bb": '"',
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u201e": '"',
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201a": "'",
+    "\u00a0": " ",
+    "\u202f": " ",
+    "\u2007": " ",
+    "\u2009": " ",
+    "\u200b": "",
+    "\u200c": "",
+    "\u200d": "",
+    "\ufeff": "",
+    "\u00ad": "",
+    "\u2013": "-",
+    "\u2014": "-",
+    "\u2015": "-",
+    "\u2212": "-",
+    "\u2026": "...",
+}
+QUOTE_FOLD = CHAR_FOLD
 
 Layout = str
 
@@ -121,8 +151,16 @@ def key_for(layout: Layout, ch: str) -> str | None:
     return _en_key(ch) if layout == "en" else _ru_key(ch)
 
 
+def _skip_char(ch: str) -> bool:
+    code = ord(ch)
+    return (code < 32 and ch not in "\n\t") or code == 127
+
+
 def plan_paste(value: str, start: Layout) -> list[Segment]:
-    """Разбивает текст на куски одной раскладки. Непечатный символ — BadChar."""
+    """Разбивает текст на куски одной раскладки.
+
+    Символа нет на клавиатуре и в CHAR_FOLD — пропускаем, как /api/hid/paste.
+    """
     if start not in ("en", "ru"):
         raise ValueError(start)
     layout = start
@@ -137,21 +175,119 @@ def plan_paste(value: str, start: Layout) -> list[Segment]:
         keys.clear()
         src.clear()
 
+    def append_mapped(mapped: str, index: int) -> None:
+        keys.append(mapped)
+        src.append(index)
+
     for index, ch in enumerate(value):
-        if ch == "\r":
+        if ch == "\r" or _skip_char(ch):
+            continue
+        folded = CHAR_FOLD.get(ch, ch)
+        if folded == "":
+            continue
+        if folded != ch:
+            for piece in folded:
+                mapped = key_for(layout, piece)
+                if mapped is None:
+                    other: Layout = "ru" if layout == "en" else "en"
+                    mapped = key_for(other, piece)
+                    if mapped is None:
+                        continue
+                    flush()
+                    layout = other
+                append_mapped(mapped, index)
             continue
         mapped = key_for(layout, ch)
         if mapped is None:
             other: Layout = "ru" if layout == "en" else "en"
             mapped = key_for(other, ch)
             if mapped is None:
-                raise BadChar(ch)
+                continue
             flush()
             layout = other
-        keys.append(mapped)
-        src.append(index)
+        append_mapped(mapped, index)
     flush()
     return segments
+
+
+def _us_hid_table() -> dict[str, tuple[int, int]]:
+    """US-символ → (modifier, HID keycode), как CharMap в paste.go."""
+    table: dict[str, tuple[int, int]] = {}
+    for index, ch in enumerate("abcdefghijklmnopqrstuvwxyz"):
+        table[ch] = (0, 4 + index)
+        table[ch.upper()] = (2, 4 + index)
+    for index, ch in enumerate("123456789"):
+        table[ch] = (0, 30 + index)
+    table["0"] = (0, 39)
+    for ch, code in {
+        "!": 30,
+        "@": 31,
+        "#": 32,
+        "$": 33,
+        "%": 34,
+        "^": 35,
+        "&": 36,
+        "*": 37,
+        "(": 38,
+        ")": 39,
+    }.items():
+        table[ch] = (2, code)
+    for ch, code in {
+        "\n": 40,
+        "\t": 43,
+        " ": 44,
+        "-": 45,
+        "=": 46,
+        "[": 47,
+        "]": 48,
+        "\\": 49,
+        ";": 51,
+        "'": 52,
+        "`": 53,
+        ",": 54,
+        ".": 55,
+        "/": 56,
+    }.items():
+        table[ch] = (0, code)
+    for ch, code in {
+        "_": 45,
+        "+": 46,
+        "{": 47,
+        "}": 48,
+        "|": 49,
+        ":": 51,
+        '"': 52,
+        "~": 53,
+        "<": 54,
+        ">": 55,
+        "?": 56,
+    }.items():
+        table[ch] = (2, code)
+    return table
+
+
+US_HID = _us_hid_table()
+
+
+def us_hid(ch: str) -> tuple[int, int]:
+    try:
+        return US_HID[ch]
+    except KeyError as exc:
+        raise BadChar(ch) from exc
+
+
+def progress_at(text: str, sent: int) -> tuple[int, int, str]:
+    """Номер текущей строки (с 1), всего строк и её текст по числу напечатанных символов."""
+    if not text:
+        return 1, 1, ""
+    pos = min(max(int(sent), 0), len(text))
+    line = text.count("\n", 0, pos) + 1
+    lines = text.count("\n") + 1
+    start = text.rfind("\n", 0, pos) + 1
+    end = text.find("\n", pos)
+    if end < 0:
+        end = len(text)
+    return line, lines, text[start:end].replace("\r", "")
 
 
 def chunk_segment(segment: Segment, size: int = PASTE_CHUNK) -> list[Segment]:

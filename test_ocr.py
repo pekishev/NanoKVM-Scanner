@@ -40,6 +40,19 @@ class StripTests(unittest.TestCase):
         for png in strips:
             self.assertTrue(png.startswith(b"\x89PNG"))
 
+    def test_crop_jpeg_to_png_region(self) -> None:
+        img = Image.new("RGB", (100, 40), "white")
+        img.paste((200, 0, 0), (0, 0, 25, 40))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=95)
+        png, width, height = ocr.crop_jpeg_to_png(buf.getvalue(), (0, 0, 0.25, 1))
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        self.assertEqual(height, 120)
+        self.assertGreater(width, 20)
+        cropped = Image.open(io.BytesIO(png))
+        red, _green, _blue = cropped.getpixel((2, 2))
+        self.assertGreater(red, 150)
+
 
 class StitchTests(unittest.TestCase):
     def test_removes_page_overlap(self) -> None:
@@ -254,10 +267,48 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(entries[1]["paths"], ["A/One.cs"])
         self.assertTrue(entries[1]["continued"])
         self.assertFalse(entries[2]["continued"])
+        self.assertEqual(entries[0]["md"], "0001.md")
         md = ocr.render_index_markdown(entries)
         self.assertIn("One.cs *(продолж.)*", md)
         self.assertIn("`A/One.cs` — стр. 1–2", md)
         self.assertIn("[0001.jpg](0001.jpg)", md)
+        self.assertIn("[0001.md](0001.md)", md)
+
+    def test_wiki_pages_keep_heading_and_md_link(self) -> None:
+        entries = ocr.build_index_entries(
+            [
+                {
+                    "index": 1,
+                    "file": "0001.jpg",
+                    "paths": [],
+                    "heading": "Приём на работу",
+                    "preview": "Приём на работу Текст статьи",
+                },
+                {
+                    "index": 2,
+                    "file": "0002.jpg",
+                    "paths": [],
+                    "heading": "",
+                    "preview": "",
+                },
+                {
+                    "index": 3,
+                    "file": "0003.jpg",
+                    "paths": [],
+                    "heading": "Отпуск",
+                    "preview": "Отпуск оформляется заранее",
+                },
+            ]
+        )
+        self.assertEqual(entries[1]["heading"], "Приём на работу")
+        self.assertTrue(entries[1]["continued"])
+        self.assertFalse(entries[2]["continued"])
+        md = ocr.render_index_markdown(entries)
+        self.assertIn("[0001.md](0001.md)", md)
+        self.assertIn("Приём на работу *(продолж.)*", md)
+        self.assertIn("Отпуск", md)
+        self.assertNotIn("Файлы на кадрах не найдены", md)
+        self.assertNotIn("## По файлам", md)
 
     def test_index_session_uses_existing_md(self) -> None:
         import json
@@ -283,8 +334,49 @@ class IndexTests(unittest.TestCase):
             text = (folder / ocr.INDEX_NAME).read_text(encoding="utf-8")
             self.assertIn("ConsentController.cs", text)
             self.assertIn("продолж", text)
+            self.assertIn("[0001.md](0001.md)", text)
+            self.assertTrue((folder / "0001.md").is_file())
+            self.assertIn("ConsentController.cs", (folder / "0001.md").read_text(encoding="utf-8"))
             payload = json.loads((folder / ocr.INDEX_JSON).read_text(encoding="utf-8"))
             self.assertEqual(payload["pages"][1]["paths"], ["Foo/ConsentController.cs"])
+            self.assertEqual(payload["pages"][0]["md"], "0001.md")
+
+    def test_index_session_saves_wiki_page_markdown(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        wiki = "# Приём на работу\n\nСотрудник оформляется в отделе кадров."
+        original_ocr = ocr.ollama_ocr_image
+        original_require = ocr.require_model
+
+        def fake_ocr(png: bytes, prompt: str | None = None, **kwargs: object) -> str:
+            self.assertTrue(png.startswith(b"\x89PNG"))
+            self.assertIsNone(prompt)
+            return wiki
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "0001.jpg").write_bytes(_bars_jpeg(8))
+            ocr.require_model = lambda: None  # type: ignore[assignment]
+            ocr.ollama_ocr_image = fake_ocr  # type: ignore[assignment]
+            try:
+                report = ocr.index_session(folder, [{"index": 1, "file": "0001.jpg"}])
+            finally:
+                ocr.ollama_ocr_image = original_ocr  # type: ignore[assignment]
+                ocr.require_model = original_require
+            self.assertEqual(report["pages"][0]["heading"], "Приём на работу")
+            self.assertEqual(report["pages"][0]["md"], "0001.md")
+            self.assertEqual(report["pages"][0]["paths"], [])
+            page_md = (folder / "0001.md").read_text(encoding="utf-8")
+            self.assertIn("Сотрудник оформляется", page_md)
+            self.assertEqual((folder / "ocr" / "0001.md").read_text(encoding="utf-8"), page_md)
+            index = (folder / ocr.INDEX_NAME).read_text(encoding="utf-8")
+            self.assertIn("[0001.jpg](0001.jpg)", index)
+            self.assertIn("[0001.md](0001.md)", index)
+            self.assertIn("Приём на работу", index)
+            payload = json.loads((folder / ocr.INDEX_JSON).read_text(encoding="utf-8"))
+            self.assertIn("отделе кадров", payload["pages"][0]["preview"])
 
 
 if __name__ == "__main__":

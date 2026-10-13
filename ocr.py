@@ -46,11 +46,11 @@ GENERIC_PROMPT = (
     "Do not repeat any line or block. Stop after the last visible line."
 )
 GLM_PROMPT = "Text Recognition:\n" + GENERIC_PROMPT
-INDEX_PROMPT = (
+TERMINAL_PROMPT = (
     "Text Recognition:\n"
-    "List every repository file path visible in this GitLab merge-request screenshot. "
-    "Prefer diff --git a/... b/..., +++ b/..., and --- a/... headers. "
-    "Output one path per line. No code, no markdown, no commentary."
+    "Transcribe the terminal or console text exactly, top to bottom. "
+    "Keep FAIL, errors, quotes, punctuation, spaces and line breaks as shown. "
+    "Do not add markdown, code fences, or commentary."
 )
 
 
@@ -245,6 +245,39 @@ def _encode_png(img: Image.Image) -> bytes:
     out = io.BytesIO()
     img.convert("RGB").save(out, format="PNG", optimize=True)
     return out.getvalue()
+
+
+def crop_jpeg_to_png(
+    jpeg: bytes, box: tuple[float, float, float, float] | None = None
+) -> tuple[bytes, int, int]:
+    """Вырезает область кадра в PNG. Мелкую полосу увеличивает — так glm-ocr лучше читает 3 строки."""
+    if Image is None:
+        raise RuntimeError("для OCR нужен Pillow")
+    img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+    width, height = img.size
+    if box is not None:
+        x, y, rw, rh = box
+        left = max(0, min(width - 1, int(round(width * x))))
+        top = max(0, min(height - 1, int(round(height * y))))
+        right = max(left + 1, min(width, int(round(width * (x + rw)))))
+        bottom = max(top + 1, min(height, int(round(height * (y + rh)))))
+        img = img.crop((left, top, right, bottom))
+    w, h = img.size
+    if h < 120:
+        scale = 120 / h
+        img = img.resize((max(1, int(round(w * scale))), 120), Image.Resampling.NEAREST)
+    return _encode_png(img), img.size[0], img.size[1]
+
+
+def read_frame_text(
+    jpeg: bytes,
+    box: tuple[float, float, float, float] | None = None,
+    *,
+    timeout: float = 90,
+) -> tuple[str, int, int]:
+    png, width, height = crop_jpeg_to_png(jpeg, box)
+    text = ollama_ocr_image(png, timeout=timeout, prompt=TERMINAL_PROMPT)
+    return text, width, height
 
 
 def slice_page(jpeg: bytes, lines_per_strip: int = DEFAULT_STRIP_LINES) -> list[bytes]:
@@ -617,6 +650,51 @@ def title_from_markdown(text: str) -> str | None:
     return None
 
 
+def page_heading(text: str) -> str:
+    return (title_from_markdown(text) or "").strip()
+
+
+def page_preview(text: str, *, limit: int = 160) -> str:
+    parts: list[str] = []
+    for line in split_lines(text or ""):
+        s = line.strip()
+        if not s or s.startswith("<!--"):
+            continue
+        parts.append(s)
+        if len(" ".join(parts)) >= limit:
+            break
+    blob = re.sub(r"\s+", " ", " ".join(parts)).strip()
+    if len(blob) > limit:
+        return blob[: max(1, limit - 1)].rstrip() + "…"
+    return blob
+
+
+def page_markdown_rel(filename: str, index: int) -> str:
+    stem = Path(filename).stem if filename else ""
+    return f"{stem}.md" if stem else f"{index:04d}.md"
+
+
+def write_page_markdown(folder: Path, filename: str, index: int, text: str) -> str:
+    """Пишет 0001.md рядом с 0001.jpg и копию в ocr/0001.md."""
+    body = (text or "").rstrip() + "\n"
+    rel = page_markdown_rel(filename, index)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / rel).write_text(body, encoding="utf-8")
+    ocr_dir = folder / OCR_DIRNAME
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    (ocr_dir / f"{index:04d}.md").write_text(body, encoding="utf-8")
+    return rel
+
+
+def read_page_markdown(folder: Path, filename: str, index: int) -> str | None:
+    sibling = folder / page_markdown_rel(filename, index)
+    numbered = folder / OCR_DIRNAME / f"{index:04d}.md"
+    for path in (sibling, numbered):
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
+    return None
+
+
 def ollama_ocr_image(png: bytes, *, timeout: float = 300, prompt: str | None = None) -> str:
     b64 = base64.b64encode(png).decode("ascii")
     prompt = prompt or GLM_PROMPT
@@ -873,24 +951,56 @@ def page_ranges(nums: list[int]) -> str:
     return ", ".join(chunks)
 
 
+def _md_cell(value: str) -> str:
+    return (value or "").replace("|", "\\|").replace("\n", " ")
+
+
+def entry_summary(entry: dict[str, Any], all_paths: list[str]) -> str:
+    names: list[str] = []
+    for path in entry.get("paths") or []:
+        label = display_path_name(path, all_paths)
+        names.append(f"{label} *(продолж.)*" if entry.get("continued") else label)
+    if names:
+        return ", ".join(names)
+    heading = str(entry.get("heading") or "").strip()
+    if heading:
+        return f"{heading} *(продолж.)*" if entry.get("continued") else heading
+    return str(entry.get("preview") or "").strip() or "—"
+
+
 def build_index_entries(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """pages: [{index, file, paths: list[str]}]. Дописывает continued с предыдущей страницы."""
-    last = ""
+    """pages: [{index, file, md, paths, heading, preview}]. Continued — с предыдущей страницы."""
+    last_paths: list[str] = []
+    last_heading = ""
     out: list[dict[str, Any]] = []
     for page in pages:
+        index = int(page.get("index") or 0)
+        jpeg = str(page.get("file") or "")
+        md = str(page.get("md") or page_markdown_rel(jpeg, index))
         paths = [p for p in (page.get("paths") or []) if p]
+        heading = str(page.get("heading") or "").strip()
+        preview = str(page.get("preview") or "").strip()
         continued = False
-        shown = list(paths)
-        if not shown and last:
-            shown = [last]
+        shown_paths = list(paths)
+        shown_heading = heading
+        if not shown_paths and last_paths:
+            shown_paths = list(last_paths)
             continued = True
-        if shown:
-            last = shown[-1]
+        elif not shown_paths and not shown_heading and last_heading:
+            shown_heading = last_heading
+            continued = True
+        if shown_paths:
+            last_paths = [shown_paths[-1]]
+        if heading:
+            last_heading = heading
         entry = {
-            "index": int(page.get("index") or 0),
-            "file": str(page.get("file") or ""),
-            "paths": shown,
+            "index": index,
+            "file": jpeg,
+            "md": md,
+            "paths": shown_paths,
             "new_paths": paths,
+            "heading": shown_heading,
+            "preview": preview,
             "continued": continued,
             "source": str(page.get("source") or ""),
         }
@@ -903,29 +1013,25 @@ def render_index_markdown(entries: list[dict[str, Any]]) -> str:
     lines = [
         "# Индекс сессии",
         "",
-        "Источник правды — JPEG. Этот список только для навигации: страница → файл.",
-        "Символам OCR нельзя доверять (скобки, `+/-`, похожие имена, склейка hunk’ов).",
+        "Каждая страница: JPEG (кадр) ↔ одноимённый markdown с распознанным текстом.",
+        "OCR может ошибаться в символах; при сомнении сверяйте с JPEG.",
         "",
-        "| Стр. | Кадр | Файлы |",
-        "| ---: | --- | --- |",
+        "| Стр. | Кадр | Текст | Содержание |",
+        "| ---: | --- | --- | --- |",
     ]
     for entry in entries:
-        names = []
-        for path in entry.get("paths") or []:
-            label = display_path_name(path, all_paths)
-            names.append(f"{label} *(продолж.)*" if entry.get("continued") else label)
-        files = ", ".join(names) if names else "—"
-        jpeg = entry.get("file") or ""
-        link = f"[{jpeg}]({jpeg})" if jpeg else ""
-        lines.append(f"| {entry.get('index')} | {link} | {files} |")
-    lines.extend(["", "## По файлам", ""])
+        jpeg = str(entry.get("file") or "")
+        md = str(entry.get("md") or "")
+        jpeg_link = f"[{jpeg}]({jpeg})" if jpeg else ""
+        md_link = f"[{md}]({md})" if md else ""
+        summary = _md_cell(entry_summary(entry, all_paths))
+        lines.append(f"| {entry.get('index')} | {jpeg_link} | {md_link} | {summary} |")
     by_file: dict[str, list[int]] = {}
     for entry in entries:
         for path in entry.get("paths") or []:
             by_file.setdefault(path, []).append(int(entry["index"]))
-    if not by_file:
-        lines.append("Файлы на кадрах не найдены.")
-    else:
+    if by_file:
+        lines.extend(["", "## По файлам", ""])
         for path in sorted(by_file):
             pages = page_ranges(by_file[path])
             lines.append(f"- `{path}` — стр. {pages}")
@@ -959,7 +1065,6 @@ def index_session(
     if not pages:
         raise RuntimeError("нет страниц для индекса")
     stop = stop or threading.Event()
-    ocr_dir = folder / OCR_DIRNAME
     total_pages = len(pages)
     raw_pages: list[dict[str, Any]] = []
 
@@ -971,7 +1076,10 @@ def index_session(
         if on_progress:
             on_progress(fields)
 
-    need_model = any(not (ocr_dir / f"{i:04d}.md").is_file() for i in range(1, total_pages + 1))
+    def has_page_md(index: int, item: dict[str, Any]) -> bool:
+        return read_page_markdown(folder, str(item.get("file") or ""), index) is not None
+
+    need_model = any(not has_page_md(i, item) for i, item in enumerate(pages, start=1))
 
     if need_model:
         if Image is None:
@@ -982,11 +1090,11 @@ def index_session(
         if stop.is_set():
             raise RuntimeError("остановлено")
         filename = str(page.get("file") or "")
-        md_path = ocr_dir / f"{pi:04d}.md"
         progress(page=pi, pages=total_pages, strip=0, strips=1, file=filename)
         emit("ocr_page", page=pi, pages=total_pages, strips=1, file=filename)
-        if md_path.is_file():
-            text = md_path.read_text(encoding="utf-8")
+        existing = read_page_markdown(folder, filename, pi)
+        if existing is not None:
+            text = existing
             source = "ocr"
         else:
             path = folder / filename
@@ -994,13 +1102,17 @@ def index_session(
                 raise RuntimeError(f"нет файла {filename}")
             progress(page=pi, pages=total_pages, strip=1, strips=1, file=filename)
             png = encode_index_image(path.read_bytes())
-            text = ollama_ocr_image(png, prompt=INDEX_PROMPT)
+            text = ollama_ocr_image(png)
             source = "image"
+        md = write_page_markdown(folder, filename, pi, text)
         raw_pages.append(
             {
                 "index": pi,
                 "file": filename,
+                "md": md,
                 "paths": extract_paths(text),
+                "heading": page_heading(text),
+                "preview": page_preview(text),
                 "source": source,
             }
         )

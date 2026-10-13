@@ -508,15 +508,32 @@ button:focus {
 .typer-bar {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
 }
 
-#type-stats {
+.type-status {
   flex: 1;
   min-width: 12em;
+  display: grid;
+  gap: 2px;
   color: var(--muted);
   font-size: 12px;
+}
+
+#type-stats,
+#type-line {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#type-line {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+
+#type-line:empty {
+  display: none;
 }
 
 .log {

@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import hotkeys
 import layout_type
 import ocr
 
@@ -106,15 +107,15 @@ HID_KEYS = {
     "Tab": 0x2B,
 }
 
-OCR_PROMPT = """# Индекс скриншотов GitLab MR
+OCR_PROMPT = """# Распознанные страницы
 
-Источник правды — JPEG в этой папке. `_index.md` только навигация: страница → файл.
-Символам OCR нельзя доверять (скобки, +/-, похожие идентификаторы, склейка hunk’ов).
-Не вставляй распознанный текст как патч.
+JPEG и одноимённый markdown лежат рядом: `0001.jpg` ↔ `0001.md`.
+`_index.md` — оглавление: страница, кадр, текст, заголовок или путь файла.
+OCR может ошибаться в символах; при сомнении смотри JPEG.
 
-1. Открой `_index.md`: кадр и пути файлов на нём.
-2. Правь код по соответствующему JPEG (`0001.jpg` …).
-3. Полный `_recognized.md`, если есть, — черновик, не исходник.
+1. Открой `_index.md`, найди нужную страницу.
+2. Читай `NNNN.md` — весь распознанный текст кадра (вики, статья, diff).
+3. Если OCR врёт — сверяй с соответствующим JPEG.
 
 Сессия: {session_name}
 Страниц: {page_count}
@@ -313,6 +314,9 @@ class KvmClient:
         self.token = ""
         self.connected = False
         self.last_error = ""
+        self.last_url = ""
+        self.last_username = "admin"
+        self.last_password = ""
         self.latest_jpeg: bytes | None = None
         self.frame_id = 0
         self._stop = threading.Event()
@@ -332,6 +336,10 @@ class KvmClient:
         return h
 
     def connect(self, url: str, username: str, password: str) -> None:
+        url = (url or "").strip()
+        username = (username or "").strip() or "admin"
+        if not url:
+            raise RuntimeError("нет адреса NanoKVM: укажите url или подключитесь из интерфейса")
         self.disconnect()
         base = url.rstrip("/")
         if not base.startswith(("http://", "https://")):
@@ -340,6 +348,9 @@ class KvmClient:
         with self.lock:
             self.base_url = base
             self.token = token
+            self.last_url = base
+            self.last_username = username
+            self.last_password = password
             self.last_error = ""
             self.connected = True
             self._stop.clear()
@@ -731,6 +742,9 @@ _LOG_RU = {
     "type_bad_char": "нельзя напечатать «{char}»",
     "type_altshift": "Alt+Shift → {layout}",
     "type_enter": "Enter",
+    "press": "нажато {keys}",
+    "type_keys": "клавиши {chars} симв., раскладка {layout}",
+    "type_keys_done": "клавиши напечатаны ({sent}), раскладка {layout}",
 }
 
 
@@ -1019,17 +1033,33 @@ class TypeJob:
 
     def status(self) -> dict[str, Any]:
         with self.lock:
+            line, lines, line_text = layout_type.progress_at(self._text, self.sent)
             return {
                 "running": self.running,
                 "layout": self.layout,
                 "sent": self.sent,
                 "total": self.total,
+                "line": line,
+                "lines": lines,
+                "line_text": line_text,
                 "error": self.error,
                 "seq": self.seq,
             }
 
 
 type_job = TypeJob()
+hid_type_lock = threading.Lock()
+last_frame_box: tuple[float, float, float, float] | None = None
+
+
+def remember_frame_box(box: tuple[float, float, float, float] | None) -> None:
+    global last_frame_box
+    last_frame_box = box
+
+
+# 12 мс удержание + 13 мс пауза ≈ 40 символов/с. Paste NanoKVM — 50 мс и без кавычек.
+KEY_HOLD_S = 0.012
+KEY_GAP_S = 0.013
 
 
 def _layout_name(value: Any) -> str:
@@ -1040,6 +1070,56 @@ def _layout_name(value: Any) -> str:
 
 
 def type_loop() -> None:
+    if not hid_type_lock.acquire(timeout=30):
+        with type_job.lock:
+            type_job.error = "клавиатура занята"
+            type_job.running = False
+        session.note("type_error", error="клавиатура занята")
+        return
+    try:
+        _type_long()
+    finally:
+        hid_type_lock.release()
+
+
+def _hid_char(ch: str) -> None:
+    modifier, code = layout_type.us_hid(ch)
+    kvm.keyboard_report(modifier, code)
+    time.sleep(KEY_HOLD_S)
+    kvm.keyboard_report(0)
+    time.sleep(KEY_GAP_S)
+
+
+def _type_segments(
+    segments: list[layout_type.Segment],
+    layout: str,
+    *,
+    stop: threading.Event | None = None,
+    on_progress: Any | None = None,
+) -> tuple[int, str, bool]:
+    current = layout
+    sent = 0
+    for segment in segments:
+        if (stop and stop.is_set()) or not kvm.connected:
+            return sent, current, True
+        if segment.layout != current:
+            kvm.alt_shift()
+            time.sleep(0.1)
+            current = segment.layout
+            session.note("type_switch", layout=current)
+            if on_progress:
+                on_progress(sent, current)
+        for ch, index in zip(segment.keys, segment.src):
+            if (stop and stop.is_set()) or not kvm.connected:
+                return sent, current, True
+            _hid_char(ch)
+            sent = index + 1
+            if on_progress and (sent % 8 == 0 or ch == "\n"):
+                on_progress(sent, current)
+    return sent, current, False
+
+
+def _type_long() -> None:
     sent = 0
     stopped = False
     try:
@@ -1048,33 +1128,20 @@ def type_loop() -> None:
             layout = type_job.layout
             text = type_job._text
         session.note("type_started", chars=len(text), layout=layout)
-        current = layout
-        for segment in segments:
-            if type_job.stop.is_set() or not kvm.connected:
-                stopped = True
-                break
-            if segment.layout != current:
-                kvm.alt_shift()
-                time.sleep(0.1)
-                current = segment.layout
-                with type_job.lock:
-                    type_job.layout = current
-                session.note("type_switch", layout=current)
-            for piece in layout_type.chunk_segment(segment):
-                if type_job.stop.is_set() or not kvm.connected:
-                    stopped = True
-                    break
-                kvm.paste_text(piece.keys)
-                sent = piece.src[-1] + 1
-                with type_job.lock:
-                    type_job.sent = sent
-                    type_job.layout = current
-            if stopped:
-                break
+
+        def progress(done: int, current: str) -> None:
+            with type_job.lock:
+                type_job.sent = done
+                type_job.layout = current
+
+        sent, current, stopped = _type_segments(
+            segments, layout, stop=type_job.stop, on_progress=progress
+        )
         if not stopped:
             sent = len(text)
-            with type_job.lock:
-                type_job.sent = sent
+        with type_job.lock:
+            type_job.sent = sent
+            type_job.layout = current
         if stopped:
             session.note("type_stopped", sent=sent, total=len(text))
         else:
@@ -1085,8 +1152,200 @@ def type_loop() -> None:
             type_job.sent = sent
         session.note("type_error", error=str(exc))
     finally:
+        try:
+            kvm.keyboard_report(0)
+        except Exception:
+            pass
         with type_job.lock:
             type_job.running = False
+
+
+def type_keys_now(text: str, layout: str) -> dict[str, Any]:
+    """Короткий текст отдельными HID-отчётами."""
+    if len(text) > layout_type.KEY_TYPE_MAX:
+        raise RuntimeError("too_long")
+    segments = layout_type.plan_paste(text, layout)
+    if not any(segment.keys for segment in segments):
+        return {"sent": len(text), "layout": layout}
+    if not kvm.connected:
+        raise RuntimeError("нет связи с NanoKVM")
+    if type_job.running or not hid_type_lock.acquire(blocking=False):
+        raise RuntimeError("busy")
+    try:
+        if type_job.running or not kvm.connected:
+            raise RuntimeError("busy" if type_job.running else "нет связи с NanoKVM")
+        session.note("type_keys", chars=len(text), layout=layout)
+        sent, current, stopped = _type_segments(segments, layout)
+        if not stopped:
+            sent = len(text)
+        with type_job.lock:
+            type_job.layout = current
+        session.note("type_keys_done", sent=sent, layout=current)
+        return {"sent": sent, "layout": current}
+    finally:
+        try:
+            kvm.keyboard_report(0)
+        except Exception:
+            pass
+        hid_type_lock.release()
+
+
+def press_chords(chords: list[hotkeys.Chord], repeat: int = 1) -> dict[str, Any]:
+    """Сочетание: модификаторы вниз, клавиша, затем отпустить всё."""
+    if repeat < 1 or repeat > hotkeys.REPEAT_MAX:
+        raise ValueError(f"repeat от 1 до {hotkeys.REPEAT_MAX}")
+    if not kvm.connected:
+        raise RuntimeError("нет связи с NanoKVM")
+    if type_job.running or not hid_type_lock.acquire(blocking=False):
+        raise RuntimeError("busy")
+    label = ", ".join(chord.label for chord in chords)
+    if repeat > 1:
+        label = f"{label} ×{repeat}"
+    try:
+        if type_job.running or not kvm.connected:
+            raise RuntimeError("busy" if type_job.running else "нет связи с NanoKVM")
+        for _ in range(repeat):
+            for chord in chords:
+                if chord.modifier:
+                    kvm.keyboard_report(chord.modifier, 0)
+                    time.sleep(0.03)
+                if chord.keycode:
+                    kvm.keyboard_report(chord.modifier, chord.keycode)
+                    time.sleep(0.04)
+                else:
+                    time.sleep(0.05)
+                kvm.keyboard_report(0)
+                time.sleep(0.03)
+        session.note("press", keys=label)
+        return {"keys": label, "repeat": repeat}
+    finally:
+        try:
+            kvm.keyboard_report(0)
+        except Exception:
+            pass
+        hid_type_lock.release()
+
+
+def jpeg_size(jpeg: bytes | None) -> tuple[int, int]:
+    if not jpeg or Image is None:
+        return 0, 0
+    try:
+        img = Image.open(io.BytesIO(jpeg))
+        width, height = img.size
+    except Exception:
+        return 0, 0
+    return int(width), int(height)
+
+
+def _flag(value: Any) -> bool:
+    if value is True or value == 1:
+        return True
+    return str(value or "").strip().lower() in ("1", "true", "yes")
+
+
+def _query_flag(params: dict[str, list[str]], name: str) -> bool:
+    vals = params.get(name) or []
+    return bool(vals) and _flag(vals[0])
+
+
+def box_to_px(
+    box: tuple[float, float, float, float] | list[float] | None, width: int, height: int
+) -> list[int] | None:
+    if box is None or width < 1 or height < 1:
+        return None
+    x, y, w, h = box
+    return [
+        int(round(x * width)),
+        int(round(y * height)),
+        int(round(w * width)),
+        int(round(h * height)),
+    ]
+
+
+def parse_frame_box(
+    params: dict[str, list[str]], size: tuple[int, int] | None = None
+) -> tuple[float, float, float, float] | None:
+    keys = ("x", "y", "w", "h")
+    present = [key for key in keys if params.get(key) and params[key][0] != ""]
+    if not present:
+        return None
+    px = _query_flag(params, "px")
+    if len(present) != 4:
+        raise ValueError(
+            "нужны x, y, w и h — пиксели кадра" if px else "нужны x, y, w и h — доли кадра от 0 до 1"
+        )
+    if px:
+        fw, fh = size or (0, 0)
+        if fw < 1 or fh < 1:
+            raise ValueError("нет кадра")
+        try:
+            x, y, w, h = (int(round(float(params[key][0]))) for key in keys)
+        except ValueError as exc:
+            raise ValueError("x, y, w и h должны быть целыми пикселями") from exc
+        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > fw or y + h > fh:
+            raise ValueError("область вне кадра")
+        return x / fw, y / fh, w / fw, h / fh
+    try:
+        x, y, w, h = (float(params[key][0]) for key in keys)
+    except ValueError as exc:
+        raise ValueError("x, y, w и h должны быть числами") from exc
+    if min(x, y, w, h) < 0 or x >= 1 or y >= 1 or w <= 0 or h <= 0:
+        raise ValueError("область вне кадра")
+    if x + w > 1.001 or y + h > 1.001:
+        raise ValueError("область вне кадра")
+    return x, y, min(w, 1 - x), min(h, 1 - y)
+
+
+def box_from_body(
+    body: dict[str, Any], size: tuple[int, int] | None = None
+) -> tuple[float, float, float, float] | None:
+    query = {
+        "x": [str(body["x"])] if body.get("x") is not None else [],
+        "y": [str(body["y"])] if body.get("y") is not None else [],
+        "w": [str(body.get("w") if body.get("w") is not None else body.get("width"))]
+        if body.get("w") is not None or body.get("width") is not None
+        else [],
+        "h": [str(body.get("h") if body.get("h") is not None else body.get("height"))]
+        if body.get("h") is not None or body.get("height") is not None
+        else [],
+    }
+    if _flag(body.get("px")):
+        query["px"] = ["1"]
+    return parse_frame_box(query, size)
+
+
+def click_xy(body: dict[str, Any]) -> tuple[float, float]:
+    x = float(body.get("x") if body.get("x") is not None else 0.5)
+    y = float(body.get("y") if body.get("y") is not None else 0.5)
+    if not _flag(body.get("px")):
+        return x, y
+    fw, fh = jpeg_size(kvm.latest_jpeg)
+    if fw < 1 or fh < 1:
+        raise ValueError("нет кадра")
+    ix, iy = int(round(x)), int(round(y))
+    if ix < 0 or iy < 0 or ix >= fw or iy >= fh:
+        raise ValueError("точка вне кадра")
+    return (ix + 0.5) / fw, (iy + 0.5) / fh
+
+
+def frame_region(jpeg: bytes, box: tuple[float, float, float, float] | None) -> tuple[bytes, int, int]:
+    if Image is None:
+        if box is not None:
+            raise RuntimeError("для части кадра нужен Pillow")
+        return jpeg, 0, 0
+    img = Image.open(io.BytesIO(jpeg))
+    width, height = img.size
+    if box is None:
+        return jpeg, width, height
+    x, y, rw, rh = box
+    left = max(0, min(width - 1, int(round(width * x))))
+    top = max(0, min(height - 1, int(round(height * y))))
+    right = max(left + 1, min(width, int(round(width * (x + rw)))))
+    bottom = max(top + 1, min(height, int(round(height * (y + rh)))))
+    cropped = img.crop((left, top, right, bottom)).convert("RGB")
+    out = io.BytesIO()
+    cropped.save(out, format="JPEG", quality=90, subsampling=0)
+    return out.getvalue(), cropped.size[0], cropped.size[1]
 
 
 def apply_scan_settings(body: dict[str, Any]) -> None:
@@ -1256,7 +1515,7 @@ def ocr_loop() -> None:
 
 
 # Поллинг UI и MJPEG — иначе консоль run.cmd забивается каждые ~700 мс.
-_QUIET_ACCESS_LOG = ("/api/status", "/api/preview")
+_QUIET_ACCESS_LOG = ("/api/status", "/api/preview", "/api/screenshot")
 _CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 
 
@@ -1323,11 +1582,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._file(target, ctype)
         if path == "/api/status":
             st = session.status()
+            fw, fh = jpeg_size(kvm.latest_jpeg)
             st["kvm"] = {
                 "connected": kvm.connected,
                 "url": kvm.base_url,
                 "frame_id": kvm.frame_id,
                 "has_frame": kvm.latest_jpeg is not None,
+                "frame_width": fw,
+                "frame_height": fh,
                 "error": kvm.last_error,
                 "pillow": Image is not None,
                 "video": kvm.video_override(),
@@ -1335,6 +1597,7 @@ class Handler(BaseHTTPRequestHandler):
             st["default_scans"] = str(DEFAULT_SCANS)
             st["ocr"] = ocr_job.status()
             st["type"] = type_job.status()
+            st["read"] = {"box": list(last_frame_box) if last_frame_box else None}
             if session.dir is not None and not st["ocr"]["output"]:
                 if (session.dir / ocr.INDEX_NAME).is_file():
                     st["ocr"]["output"] = ocr.INDEX_NAME
@@ -1358,6 +1621,27 @@ class Handler(BaseHTTPRequestHandler):
             if not jpeg:
                 return self._send(503, b"no frame", "text/plain")
             return self._send(200, jpeg, "image/jpeg")
+        if path == "/api/screenshot.jpg":
+            jpeg = kvm.latest_jpeg
+            if not jpeg:
+                return self._send(503, b"no frame", "text/plain")
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                size = jpeg_size(jpeg)
+                box = parse_frame_box(query, size)
+                data, width, height = frame_region(jpeg, box)
+                remember_frame_box(box)
+            except (ValueError, RuntimeError) as exc:
+                return self._json({"ok": False, "error": str(exc)}, 400)
+            extra = {}
+            if width:
+                extra["X-Image-Width"] = str(width)
+            if height:
+                extra["X-Image-Height"] = str(height)
+            if size[0] and size[1]:
+                extra["X-Frame-Width"] = str(size[0])
+                extra["X-Frame-Height"] = str(size[1])
+            return self._send(200, data, "image/jpeg", extra)
         if path == "/api/preview.mjpeg":
             return self._preview_mjpeg()
         if path.startswith("/api/page/"):
@@ -1375,7 +1659,15 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self._read_json()
             if path == "/api/connect":
-                kvm.connect(body.get("url") or "", body.get("username") or "admin", body.get("password") or "")
+                url = str(body.get("url") or "").strip()
+                username = str(body.get("username") or "").strip()
+                password = str(body.get("password") or "")
+                if not url:
+                    url = kvm.last_url
+                    username = username or kvm.last_username
+                    if "password" not in body:
+                        password = kvm.last_password
+                kvm.connect(url, username or "admin", password)
                 session.note("connected", url=kvm.base_url)
                 video = kvm.video_override()
                 if video:
@@ -1424,13 +1716,19 @@ class Handler(BaseHTTPRequestHandler):
                 session.note("focused")
                 return self._json({"ok": True})
             if path == "/api/click":
-                nx = float(body.get("x") if body.get("x") is not None else 0.5)
-                ny = float(body.get("y") if body.get("y") is not None else 0.5)
+                nx, ny = click_xy(body)
                 js_btn = int(body.get("button") or 0)
                 hid_btn = {0: 1, 1: 4, 2: 2}.get(js_btn, 1)
                 kvm.click_norm(nx, ny, hid_btn)
                 session.note("click", x=f"{nx:.3f}", y=f"{ny:.3f}")
-                return self._json({"ok": True})
+                fw, fh = jpeg_size(kvm.latest_jpeg)
+                payload: dict[str, Any] = {"ok": True}
+                if _flag(body.get("px")):
+                    payload["x"] = int(round(float(body["x"])))
+                    payload["y"] = int(round(float(body["y"])))
+                    payload["frame_width"] = fw
+                    payload["frame_height"] = fh
+                return self._json(payload)
             if path == "/api/wheel":
                 nx = float(body.get("x") if body.get("x") is not None else 0.5)
                 ny = float(body.get("y") if body.get("y") is not None else 0.5)
@@ -1474,6 +1772,62 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/ocr/stop":
                 ocr_job.stop.set()
                 return self._json({"ok": True})
+            if path == "/api/read_terminal":
+                jpeg = kvm.latest_jpeg
+                if not jpeg:
+                    return self._json({"ok": False, "error": "no frame"}, 503)
+                fw, fh = jpeg_size(jpeg)
+                given = any(body.get(key) is not None for key in ("x", "y", "w", "h", "width", "height"))
+                box = box_from_body(body, (fw, fh)) if given else last_frame_box
+                text, width, height = ocr.read_frame_text(jpeg, box)
+                remember_frame_box(box)
+                box_out: list[int] | list[float] | None = list(box) if box else None
+                if _flag(body.get("px")):
+                    box_out = box_to_px(box, fw, fh)
+                return self._json(
+                    {
+                        "ok": True,
+                        "text": text,
+                        "box": box_out,
+                        "width": width,
+                        "height": height,
+                        "frame_width": fw,
+                        "frame_height": fh,
+                    }
+                )
+            if path == "/api/type/keys":
+                text = str(body.get("text") or "")
+                layout = _layout_name(body.get("layout"))
+                if len(text) > layout_type.KEY_TYPE_MAX:
+                    return self._json(
+                        {"ok": False, "error": "too_long", "max": layout_type.KEY_TYPE_MAX},
+                        400,
+                    )
+                try:
+                    result = type_keys_now(text, layout)
+                except layout_type.BadChar as exc:
+                    session.note("type_bad_char", char=exc.char)
+                    return self._json({"ok": False, "error": "bad_char", "char": exc.char}, 400)
+                except RuntimeError as exc:
+                    if str(exc) == "busy":
+                        return self._json({"ok": False, "error": "busy"}, 409)
+                    raise
+                return self._json({"ok": True, **result})
+            if path == "/api/press":
+                raw = body.get("keys")
+                if raw is None:
+                    raw = body.get("combo") or ""
+                try:
+                    repeat = int(body.get("repeat") or 1)
+                    chords = hotkeys.parse_keys(raw if isinstance(raw, list) else str(raw))
+                    result = press_chords(chords, repeat)
+                except ValueError as exc:
+                    return self._json({"ok": False, "error": "bad_keys", "msg": str(exc)}, 400)
+                except RuntimeError as exc:
+                    if str(exc) == "busy":
+                        return self._json({"ok": False, "error": "busy"}, 409)
+                    raise
+                return self._json({"ok": True, **result})
             if path == "/api/type/start":
                 text = str(body.get("text") or "")
                 layout = _layout_name(body.get("layout"))

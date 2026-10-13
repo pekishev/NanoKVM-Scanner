@@ -57,7 +57,7 @@
 
         <section>
           <h2 data-i18n="ocr">Индекс</h2>
-          <p class="hint" data-i18n="ocrIntro">По кадрам собирается список «страница → файл» (diff --git). Картинки остаются источником правды; индекс только для навигации.</p>
+          <p class="hint" data-i18n="ocrIntro">По кадрам распознаётся весь текст. Для каждой страницы сохраняется markdown рядом с JPEG; индекс связывает кадр и текст.</p>
           <button id="btn-ocr" class="btn accent" type="button" data-i18n="ocrRun">Построить индекс</button>
           <a id="ocr-open" class="btn-link ocr-open" hidden href="/api/ocr/result" target="_blank" rel="noopener" data-i18n="ocrOpen">Открыть индекс</a>
         </section>
@@ -164,7 +164,10 @@
           <p class="hint" data-i18n="typeHint">На удалённый ПК, как набор клавиш. Укажите текущую раскладку: смешанный текст сам шлёт Alt+Shift.</p>
           <textarea id="type-text" rows="3" data-i18n-placeholder="typePlaceholder" placeholder="Текст для удалённого ПК…"></textarea>
           <div class="typer-bar">
-            <span id="type-stats"></span>
+            <div class="type-status">
+              <span id="type-stats"></span>
+              <span id="type-line"></span>
+            </div>
             <button id="btn-type" class="btn accent" type="button" data-i18n="typeRun">Напечатать</button>
             <button id="btn-type-stop" class="btn danger" type="button" hidden data-i18n="typeStop">Стоп</button>
             <button id="btn-type-clear" class="btn ghost" type="button" data-i18n="typeClear">Очистить</button>
@@ -179,7 +182,7 @@
           <span id="page-count">0</span>
         </div>
         <div id="thumbs" class="thumbs"></div>
-        <p class="hint" id="folder-hint" data-i18n="folderHint">После скана нажмите «Распознать» — локальная OCR-VLM сшьёт markdown.</p>
+        <p class="hint" id="folder-hint" data-i18n="folderHint">После скана нажмите «Построить индекс» — получите JPEG ↔ markdown с текстом страницы.</p>
       </aside>
     </div>
     <script src="/static/app.js"></script>
