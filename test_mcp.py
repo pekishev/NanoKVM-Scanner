@@ -48,6 +48,7 @@ class ScannerApiTests(unittest.TestCase):
             app.type_job.total = 0
             app.type_job._text = ""
             app.type_job.error = ""
+            app.type_job.started_at = 0.0
 
     def _json(self, method: str, path: str, body: dict | None = None) -> dict:
         data = None if body is None else json.dumps(body).encode("utf-8")
@@ -76,18 +77,42 @@ class ScannerApiTests(unittest.TestCase):
         try:
             with job.lock:
                 job.sent = 6
+                job.started_at = time.monotonic() - 1.0
             st = job.status()
             self.assertEqual(st["line"], 2)
             self.assertEqual(st["lines"], 3)
             self.assertEqual(st["line_text"], "beta")
             self.assertEqual(st["sent"], 6)
             self.assertEqual(st["total"], 16)
+            self.assertGreater(st["cps"], 0)
         finally:
             with job.lock:
                 job.running = False
                 job._text = ""
                 job.sent = 0
                 job.total = 0
+                job.started_at = 0.0
+
+    def test_altshift_keeps_layout(self) -> None:
+        called = {"n": 0}
+
+        def fake_alt() -> None:
+            called["n"] += 1
+
+        app.kvm.connected = True
+        original = app.kvm.alt_shift
+        app.kvm.alt_shift = fake_alt  # type: ignore[method-assign]
+        try:
+            with app.type_job.lock:
+                app.type_job.layout = "en"
+            payload = self._json("POST", "/api/type/altshift", {"layout": "en"})
+            self.assertTrue(payload.get("ok"))
+            self.assertEqual(payload.get("layout"), "en")
+            self.assertEqual(called["n"], 1)
+            self.assertEqual(app.type_job.layout, "en")
+        finally:
+            app.kvm.alt_shift = original  # type: ignore[method-assign]
+            app.kvm.connected = False
 
     def test_progress_stays_on_first_line(self) -> None:
         self.assertEqual(app.progress_at("hello\nworld", 3), (1, 2, "hello"))

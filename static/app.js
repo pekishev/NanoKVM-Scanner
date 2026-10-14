@@ -89,7 +89,7 @@ const I18N = {
     typeEn: "EN",
     typeRu: "RU",
     typeAltShift: "Alt+Shift",
-    typeAltShiftTip: "Переключить раскладку на удалённом ПК",
+    typeAltShiftTip: "Alt+Shift на удалённом ПК (комбобокс не меняется)",
     typeHint: "Печать через MCP NanoKVM-Pro на устройстве. Укажите текущую раскладку: смешанный текст сам шлёт Alt+Shift.",
     typePlaceholder: "Текст для удалённого ПК…",
     typeRun: "Напечатать",
@@ -99,7 +99,8 @@ const I18N = {
     typeMin: "~{min} мин",
     typeMinSec: "~{min} мин {sec} с",
     typeStats: "{lines} стр., {chars} симв., {time}",
-    typeProgress: "осталось {time} · {pct}%",
+    typeProgress: "осталось {time} · {pct}% · {cps} симв/с",
+    typeProgressWarmup: "осталось {time} · {pct}%",
     typeLine: "стр. {line}/{lines}: {preview}",
     typeLineBlank: "стр. {line}/{lines}",
     typeBadChar: "Нельзя напечатать «{char}»",
@@ -204,7 +205,7 @@ const I18N = {
     typeEn: "EN",
     typeRu: "RU",
     typeAltShift: "Alt+Shift",
-    typeAltShiftTip: "Switch the layout on the remote PC",
+    typeAltShiftTip: "Alt+Shift on the remote PC (combobox stays put)",
     typeHint: "Types through NanoKVM-Pro MCP on the device. Set its current layout; mixed text sends Alt+Shift on its own.",
     typePlaceholder: "Text for the remote PC…",
     typeRun: "Type",
@@ -214,7 +215,8 @@ const I18N = {
     typeMin: "~{min} min",
     typeMinSec: "~{min} min {sec} s",
     typeStats: "{lines} lines, {chars} chars, {time}",
-    typeProgress: "{time} left · {pct}%",
+    typeProgress: "{time} left · {pct}% · {cps} chars/s",
+    typeProgressWarmup: "{time} left · {pct}%",
     typeLine: "line {line}/{lines}: {preview}",
     typeLineBlank: "line {line}/{lines}",
     typeBadChar: "Cannot type “{char}”",
@@ -864,9 +866,12 @@ function formatTypeProgress(job) {
   const sent = job.sent || 0;
   const total = job.total || 0;
   const remaining = Math.max(0, total - sent);
-  const time = formatDuration((remaining / TYPE_CPS) * 1000);
+  const cps = Number(job.cps) || 0;
+  const rate = cps > 0 ? cps : TYPE_CPS;
+  const time = formatDuration((remaining / rate) * 1000);
   const pct = total > 0 ? Math.min(100, Math.round((sent / total) * 100)) : 0;
-  return t("typeProgress", { time, pct });
+  if (cps > 0) return t("typeProgress", { time, pct, cps: cps.toFixed(1) });
+  return t("typeProgressWarmup", { time, pct });
 }
 
 function formatTypeLine(job) {
@@ -945,9 +950,7 @@ $("btn-type-clear").onclick = () => {
 
 $("btn-altshift").onclick = withBusy(async () => {
   try {
-    const data = await api("/api/type/altshift", { layout: els.typeLayout.value });
-    if (data.layout === "en" || data.layout === "ru") els.typeLayout.value = data.layout;
-    persist();
+    await api("/api/type/altshift", { layout: els.typeLayout.value });
   } catch (err) {
     throw typeError(err);
   }

@@ -1069,6 +1069,7 @@ class TypeJob:
         self.error = ""
         self.seq = 0
         self._text = ""
+        self.started_at = 0.0
 
     def begin(self, text: str, layout: str) -> None:
         with self.lock:
@@ -1080,10 +1081,16 @@ class TypeJob:
             self.seq += 1
             self.error = ""
             self._text = text
+            self.started_at = time.monotonic()
 
     def status(self) -> dict[str, Any]:
         with self.lock:
             line, lines, line_text = progress_at(self._text, self.sent)
+            cps = 0.0
+            if self.started_at > 0 and self.sent > 0:
+                elapsed = time.monotonic() - self.started_at
+                if elapsed > 0.2:
+                    cps = round(self.sent / elapsed, 1)
             return {
                 "running": self.running,
                 "layout": self.layout,
@@ -1092,6 +1099,7 @@ class TypeJob:
                 "line": line,
                 "lines": lines,
                 "line_text": line_text,
+                "cps": cps,
                 "error": self.error,
                 "seq": self.seq,
             }
@@ -1890,9 +1898,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise RuntimeError("нет связи с NanoKVM")
                 if type_job.running:
                     return self._json({"ok": False, "error": "busy"}, 409)
+                # Комбобокс — известная раскладка; Alt+Shift только на удалённом ПК,
+                # чтобы подтянуть её к комбобоксу, а не наоборот.
                 layout = _layout_name(body.get("layout"))
                 kvm.alt_shift()
-                layout = "ru" if layout == "en" else "en"
                 with type_job.lock:
                     type_job.layout = layout
                 session.note("type_altshift", layout=layout)
